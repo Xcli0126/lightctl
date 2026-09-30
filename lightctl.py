@@ -824,8 +824,9 @@ class App(tk.Tk):
     def _build_ui(self):
         th = theme()
         # 顶栏：标题 + 设置按钮
-        top = tk.Frame(self, bg=th["BG"])
-        top.pack(fill="x", padx=14, pady=(10, 4))
+        self._top = tk.Frame(self, bg=th["BG"])
+        self._top.pack(fill="x", padx=14, pady=(10, 4))
+        top = self._top
         self.title_lbl = tk.Label(top, text=t("app_title"), fg=th["ACCENT"],
                                   bg=th["BG"], anchor="w",
                                   font=("Sans", 13, "bold"))
@@ -849,8 +850,9 @@ class App(tk.Tk):
             self.cards[d] = Card(self, d, self._on_change)
 
         # 底部按钮
-        bot = tk.Frame(self, bg=th["BG"])
-        bot.pack(fill="x", padx=14, pady=(4, 8))
+        self._bot = tk.Frame(self, bg=th["BG"])
+        self._bot.pack(fill="x", padx=14, pady=(4, 8))
+        bot = self._bot
         self.all_on_btn = tk.Button(bot, text=t("all_on"),
                                     command=lambda: self._all(True),
                                     bg=th["BTN_BG"], fg=th["FG"],
@@ -1017,6 +1019,9 @@ class App(tk.Tk):
     def retheme(self):
         th = theme()
         self.configure(bg=th["BG"])
+        # 容器 Frame 也要刷（P5）
+        self._top.config(bg=th["BG"])
+        self._bot.config(bg=th["BG"])
         for w in (self.title_lbl, self.backend_lbl, self.status_lbl,
                   self.log_lbl):
             w.config(bg=th["BG"])
@@ -1028,14 +1033,17 @@ class App(tk.Tk):
                   self.refresh_btn):
             b.config(bg=th["BTN_BG"], fg=th["FG"],
                      activebackground=th["HL_BG"], activeforeground=th["FG"])
-        # 卡片重建（LabelFrame 配色不好热改）
+        # 卡片重建（LabelFrame 配色不好热改）；用 before=self._bot 保序（P4）
         for d in DEVICES:
             old = self.cards.pop(d)
             old.frame.destroy()
         for d in DEVICES:
-            self.cards[d] = Card(self, d, self._on_change)
+            c = Card(self, d, self._on_change)
+            c.frame.pack_forget()
+            c.frame.pack(fill="x", padx=14, pady=6, before=self._bot)
+            self.cards[d] = c
             st = self.state[d]
-            self.cards[d].set_state(st.get("on", True), st.get("level", "high"))
+            c.set_state(st.get("on", True), st.get("level", "high"))
         self._refresh_status()
 # ---------- 自测 ----------
 def selftest():
