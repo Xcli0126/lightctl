@@ -833,6 +833,7 @@ class App(tk.Tk):
 
         self._busy = False
         self.cards = {}
+        self._themed = []   # (widget, role) 注册表，retheme 遍历（C7）
         self._build_ui()
         self._restore_ui()
         self._refresh_status()
@@ -862,6 +863,11 @@ class App(tk.Tk):
             return "off"
         return "partial"
 
+    def _reg(self, widget, role):
+        """登记控件主题角色，retheme 统一刷新（C7）。"""
+        self._themed.append((widget, role))
+        return widget
+
     def _build_ui(self):
         th = theme()
         # 顶栏：标题 + 设置按钮
@@ -871,47 +877,47 @@ class App(tk.Tk):
         self.title_lbl = tk.Label(top, text=t("app_title"), fg=th["ACCENT"],
                                   bg=th["BG"], anchor="w",
                                   font=("Sans", 13, "bold"))
+        self._reg(self.title_lbl, "title")
         self.title_lbl.pack(side="left")
         self.set_btn = tk.Button(top, text="⚙ " + t("settings"),
                                  command=self.open_settings,
                                  bg=th["BTN_BG"], fg=th["FG"], relief="flat",
                                  padx=8, pady=2)
+        self._reg(self.set_btn, "btn")
         self.set_btn.pack(side="right")
 
         self.backend_lbl = tk.Label(top, text=t("backend"), fg=th["FG_OK"],
                                     bg=th["BG"], anchor="w", font=("Sans", 9))
+        self._reg(self.backend_lbl, "backend")
         self.backend_lbl.pack(fill="x")
 
         self.status_lbl = tk.Label(top, text="", fg=th["FG"], bg=th["BG"],
                                    anchor="w", font=("Sans", 9))
+        self._reg(self.status_lbl, "status")
         self.status_lbl.pack(fill="x", pady=(2, 0))
 
         # 两张卡
         for d in DEVICES:
             self.cards[d] = Card(self, d, self._on_change)
 
-        # 底部按钮
+        # 底部按钮（C6 工厂）
         self._bot = tk.Frame(self, bg=th["BG"])
         self._bot.pack(fill="x", padx=14, pady=(4, 8))
         bot = self._bot
-        self.all_on_btn = tk.Button(bot, text=t("all_on"),
-                                    command=lambda: self._all(True),
-                                    bg=th["BTN_BG"], fg=th["FG"],
-                                    relief="flat", padx=10, pady=4)
+        mk = lambda txt, cmd: tk.Button(
+            bot, text=txt, command=cmd, bg=th["BTN_BG"], fg=th["FG"],
+            relief="flat", padx=10, pady=4,
+            activebackground=th["HL_BG"], activeforeground=th["FG"])
+        self.all_on_btn = self._reg(mk(t("all_on"), lambda: self._all(True)), "btn")
         self.all_on_btn.pack(side="left")
-        self.all_off_btn = tk.Button(bot, text=t("all_off"),
-                                     command=lambda: self._all(False),
-                                     bg=th["BTN_BG"], fg=th["FG"],
-                                     relief="flat", padx=10, pady=4)
+        self.all_off_btn = self._reg(mk(t("all_off"), lambda: self._all(False)), "btn")
         self.all_off_btn.pack(side="left", padx=(8, 0))
-        self.refresh_btn = tk.Button(bot, text=t("refresh"),
-                                     command=self._refresh_status,
-                                     bg=th["BTN_BG"], fg=th["FG"],
-                                     relief="flat", padx=10, pady=4)
+        self.refresh_btn = self._reg(mk(t("refresh"), self._refresh_status), "btn")
         self.refresh_btn.pack(side="right")
 
         self.log_lbl = tk.Label(self, text="", fg=th["FG_INFO"], bg=th["BG"],
                                 anchor="w", font=("Sans", 9), padx=14)
+        self._reg(self.log_lbl, "log")
         self.log_lbl.pack(fill="x", pady=(0, 10))
 
     def _restore_ui(self):
@@ -1079,20 +1085,18 @@ class App(tk.Tk):
     def retheme(self):
         th = theme()
         self.configure(bg=th["BG"])
-        # 容器 Frame 也要刷（P5）
+        # 容器 Frame（P5）+ 注册表遍历（C7）
         self._top.config(bg=th["BG"])
         self._bot.config(bg=th["BG"])
-        for w in (self.title_lbl, self.backend_lbl, self.status_lbl,
-                  self.log_lbl):
+        fg_by_role = {"title": th["ACCENT"], "backend": th["FG_OK"],
+                      "status": th["FG"], "log": th["FG_INFO"]}
+        for w, role in self._themed:
             w.config(bg=th["BG"])
-        self.title_lbl.config(fg=th["ACCENT"])
-        self.backend_lbl.config(fg=th["FG_OK"])
-        self.status_lbl.config(fg=th["FG"])
-        self.log_lbl.config(fg=th["FG_INFO"])
-        for b in (self.set_btn, self.all_on_btn, self.all_off_btn,
-                  self.refresh_btn):
-            b.config(bg=th["BTN_BG"], fg=th["FG"],
-                     activebackground=th["HL_BG"], activeforeground=th["FG"])
+            if role == "btn":
+                w.config(bg=th["BTN_BG"], fg=th["FG"],
+                         activebackground=th["HL_BG"], activeforeground=th["FG"])
+            elif role in fg_by_role:
+                w.config(fg=fg_by_role[role])
         # 卡片重建（LabelFrame 配色不好热改）；用 before=self._bot 保序（P4）
         for d in DEVICES:
             old = self.cards.pop(d)
