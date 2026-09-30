@@ -162,6 +162,11 @@ def t(key, **kw):
     return s
 
 
+def _dev_label(dev):
+    """设备名 → 当前语言标签（模块级，Backend/Card/App 共用）。"""
+    return t("rear_name" if dev == "rear" else "kbd_name")
+
+
 def set_lang(lang):
     global _LANG
     _LANG = lang if lang in _STRINGS else "zh"
@@ -181,8 +186,8 @@ def _read_json(path, default):
             v = json.load(f)
             if isinstance(v, dict):
                 return v
-    except Exception:
-        pass
+    except Exception as e:
+        sys.stderr.write(f"lightctl: read {path}: {e}\n")
     return default
 
 
@@ -191,8 +196,10 @@ def _write_json(path, data):
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
-    except Exception:
-        pass
+        return True
+    except Exception as e:
+        sys.stderr.write(f"lightctl: write {path}: {e}\n")
+        return False
 
 
 def load_settings():
@@ -226,7 +233,8 @@ def set_autostart(enabled):
         elif os.path.exists(AUTOSTART_FILE):
             os.remove(AUTOSTART_FILE)
         return True
-    except Exception:
+    except Exception as e:
+        sys.stderr.write(f"lightctl: autostart: {e}\n")
         return False
 
 
@@ -259,18 +267,20 @@ def find_aura_nodes():
     out = {}
     for ue in sorted(glob.glob("/sys/class/hidraw/hidraw*/device/uevent")):
         try:
-            txt = open(ue).read()
+            with open(ue) as f:
+                txt = f.read()
         except OSError:
             continue
         if "00000B05" not in txt:
             continue
-        hidid = next((l for l in txt.splitlines() if l.startswith("HID_ID=")), "")
+        hidid = next((ln for ln in txt.splitlines() if ln.startswith("HID_ID=")), "")
         if not hidid:
             continue
         prod = hidid.split("=")[-1].split(":")[-1].upper().lstrip("0")
         if prod not in (PID_REAR, PID_KEYBOARD):
             continue
-        dev = ue.split("/")[4]
+        # uevent 路径 …/hidrawN/device/uevent → hidrawN
+        dev = os.path.basename(os.path.dirname(os.path.dirname(ue)))
         path = "/dev/" + dev
         try:
             fd = os.open(path, os.O_RDWR)
@@ -361,8 +371,7 @@ class Backend:
                     dev.turn_on(level)
                 else:
                     dev.turn_off()
-                label = t("rear_name" if name == "rear" else "kbd_name")
-                return True, f"{label} → {t('state_on' if on else 'state_off')}"
+                return True, f"{_dev_label(name)} → {t('state_on' if on else 'state_off')}"
             except OSError as e:
                 return False, str(e)
 
@@ -371,7 +380,7 @@ class Backend:
         with self._lock:
             for name in DEVICES:
                 if name not in self.nodes:
-                    errs.append(name)
+                    errs.append(_dev_label(name))
                     continue
                 dev = AuraDevice(self.nodes[name])
                 try:
@@ -380,7 +389,7 @@ class Backend:
                     else:
                         dev.turn_off()
                 except OSError as e:
-                    errs.append(f"{name}: {e}")
+                    errs.append(f"{_dev_label(name)}: {e}")
         if errs:
             return False, "; ".join(errs)
         return True, t("all_on_msg") if on else t("all_off_msg")
@@ -445,17 +454,20 @@ def get_icon(state="on", size=64):
 
 
 def _icon_path(state="on", size=64):
-    """把图标写到临时文件，返回路径（供 PhotoImage / 托盘用）。"""
+    """图标 PNG 路径；已存在则直接返回，避免每次刷新重写磁盘（P11）。"""
+    path = os.path.join(CONFIG_DIR, f"icon_{state}_{size}.png")
+    if os.path.exists(path) and os.path.getsize(path) > 0:
+        return path
     data = get_icon(state, size)
     if not data:
         return None
-    path = os.path.join(CONFIG_DIR, f"icon_{state}_{size}.png")
     try:
         os.makedirs(CONFIG_DIR, exist_ok=True)
         with open(path, "wb") as f:
             f.write(data)
         return path
-    except Exception:
+    except Exception as e:
+        sys.stderr.write(f"lightctl: icon write {path}: {e}\n")
         return None
 
 
@@ -572,7 +584,7 @@ class Tray:
         self.app.after(0, _open)
 
     def _on_quit(self, *_):
-        self.app.after(0, self.app.quit)
+        self.app.after(0, self.app.shutdown)
 
     def stop(self):
         if self.ind is None:
@@ -605,7 +617,7 @@ class Card:
         self.on_change = on_change
         th = theme()
         self.frame = tk.LabelFrame(
-            parent, text=" " + t("rear_name" if dev == "rear" else "kbd_name") + " ",
+            parent, text=" " + _dev_label(dev) + " ",
             bg=th["CARD_BG"], fg=th["FG"], font=("Sans", 11, "bold"),
             padx=12, pady=10,
         )
@@ -744,6 +756,10 @@ class SettingsDialog(tk.Toplevel):
                  bg=th["BG"], fg=th["FG_DIM"], font=("Sans", 9)
                  ).pack(fill="x", padx=16, pady=(4, 8))
 
+        self._fb_lbl = tk.Label(self, text="", bg=th["BG"], fg=th["FG_OK"],
+                                font=("Sans", 9), anchor="w")
+        self._fb_lbl.pack(fill="x", padx=16)
+
         tk.Button(self, text=t("close"), command=self.destroy,
                   bg=th["BTN_BG"], fg=th["FG"], relief="flat",
                   padx=16, pady=4).pack(pady=(0, 12))
@@ -766,10 +782,19 @@ class SettingsDialog(tk.Toplevel):
         self.app.apply_tray()
 
     def _on_autostart(self):
-        ok = set_autostart(self.auto_var.get())
-        if not ok:
+        enabled = self.auto_var.get()
+        if set_autostart(enabled):
+            self._feedback(t("autostart_on" if enabled else "autostart_off"))
+        else:
             messagebox.showerror(t("settings_title"),
                                  t("fail", m=AUTOSTART_FILE), parent=self)
+
+    def _feedback(self, msg):
+        """对话框内短暂显示操作反馈。"""
+        self._fb_lbl.config(text=msg)
+        self.after(2500, lambda: self._fb_lbl.config(text=""))
+
+
 # ---------- UI：主窗口 ----------
 class App(tk.Tk):
     def __init__(self):
@@ -935,7 +960,7 @@ class App(tk.Tk):
         threading.Thread(target=worker, daemon=True).start()
 
     def _dev_label(self, dev):
-        return t("rear_name" if dev == "rear" else "kbd_name")
+        return _dev_label(dev)
 
     def _all(self, on):
         if self._busy:
@@ -998,14 +1023,17 @@ class App(tk.Tk):
         self.lift()
         self.attributes("-topmost", True)
         self.focus_force()
+        # 短暂置顶后清除，避免永久悬浮（P10）
+        self.after(400, lambda: self.attributes("-topmost", False))
 
     def _on_close(self):
         if self.settings.get("tray", True) and self.tray.ind:
             self.withdraw()
         else:
-            self.quit()
+            self.shutdown()
 
-    def quit(self):
+    def shutdown(self):
+        """安全退出（不覆盖 Tk 内建 quit，P9）。"""
         try:
             self.tray.stop()
         except Exception:
