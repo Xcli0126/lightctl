@@ -19,6 +19,7 @@ lightctl — ROG Flow Z13 (GZ302EA) 灯光控制 GUI
 import ctypes
 import ctypes.util
 import glob
+import argparse
 import io
 import json
 import os
@@ -1142,28 +1143,30 @@ def selftest():
 
 
 def main():
-    if "--selftest" in sys.argv:
+    ap = argparse.ArgumentParser(prog=APP_NAME, description=t("app_title"))
+    ap.add_argument("--selftest", action="store_true",
+                    help="run link self-test and exit")
+    ap.add_argument("--version", action="version",
+                    version=f"{APP_NAME} {APP_VERSION}")
+    ap.add_argument("--geometry", metavar="WxH+X+Y",
+                    help="window geometry (default: centered)")
+    ap.add_argument("--open-settings", action="store_true",
+                    help="open the settings dialog on start")
+    args = ap.parse_args()
+    if args.selftest:
         raise SystemExit(selftest())
-    if "--version" in sys.argv:
-        print(f"{APP_NAME} {APP_VERSION}")
-        raise SystemExit(0)
-    geo = None
-    open_settings = "--open-settings" in sys.argv
-    for i, a in enumerate(sys.argv):
-        if a == "--geometry" and i + 1 < len(sys.argv):
-            geo = sys.argv[i + 1]
     app = App()
     try:
         app.update_idletasks()
-        if geo:
-            app.geometry(geo)
+        if args.geometry:
+            app.geometry(args.geometry)
         else:
             w, h = app.winfo_width(), app.winfo_height()
             sw, sh = app.winfo_screenwidth(), app.winfo_screenheight()
             app.geometry(f"+{(sw - w) // 2}+{(sh - h) // 3}")
     except tk.TclError:
         pass
-    if open_settings:
+    if args.open_settings:
         app.after(600, app.open_settings)
     app.mainloop()
 
