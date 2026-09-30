@@ -477,10 +477,10 @@ class Tray:
     def __init__(self, app):
         self.app = app
         self.ind = None
-        self.menu = None
         self._available = _tray_available()
-        self._thread = None
         self._state = "on"
+        self._Gtk = None
+        self._GLib = None
 
     def start(self):
         if not self._available or self.ind is not None:
@@ -509,14 +509,13 @@ class Tray:
             self.mi_rear = _mi(t("rear_zone"), self._on_rear)
             self.mi_kbd = _mi(t("kbd_zone"), self._on_kbd)
             menu.append(Gtk.SeparatorMenuItem())
-            self.mi_show = _mi(t("show_win"), self._on_show)
+            _mi(t("show_win"), self._on_show)
             _mi(t("settings"), self._on_settings)
             menu.append(Gtk.SeparatorMenuItem())
             _mi(t("quit"), self._on_quit)
             menu.show_all()
             ind.set_menu(menu)
             self.ind = ind
-            self.menu = menu
             self._update_icon(self._state)
 
         GLib.idle_add(_build)
@@ -556,21 +555,24 @@ class Tray:
             return False
         self._call(_do)
 
+    # 托盘回调跑在 GTK 线程，Tk 只能被创建线程访问 —— 一律 after(0,...) 投递回主线程
     def _on_rear(self, *_):
-        self.app.toggle_from_tray("rear")
+        self.app.after(0, self.app.toggle_from_tray, "rear")
 
     def _on_kbd(self, *_):
-        self.app.toggle_from_tray("keyboard")
+        self.app.after(0, self.app.toggle_from_tray, "keyboard")
 
     def _on_show(self, *_):
-        self.app.show_window()
+        self.app.after(0, self.app.show_window)
 
     def _on_settings(self, *_):
-        self.app.show_window()
-        self.app.open_settings()
+        def _open():
+            self.app.show_window()
+            self.app.open_settings()
+        self.app.after(0, _open)
 
     def _on_quit(self, *_):
-        self.app.quit()
+        self.app.after(0, self.app.quit)
 
     def stop(self):
         if self.ind is None:
