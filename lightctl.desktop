@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=lightctl
+Name[zh_CN]=Z13 灯光控制
+Comment=ROG Flow Z13 背光与键盘灯独立开关
+Comment[zh_CN]=ROG Flow Z13 背光与键盘灯独立开关
+Exec=python3 /home/baal/Dsh_Default/lightctl/lightctl.py
+Icon=preferences-desktop-display
+Terminal=false
+Categories=Settings;HardwareSettings;
+Keywords=RGB;light;keyboard;backlight;ROG;Z13;
+StartupNotify=true
