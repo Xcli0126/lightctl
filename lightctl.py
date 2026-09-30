@@ -628,10 +628,28 @@ class Tray:
 
 
 # ---------- UI：控制卡 ----------
+def _lbl(parent, text, bg, fg, font=("Sans", 10)):
+    return tk.Label(parent, text=text, bg=bg, fg=fg, font=font)
+
+
+def _btn(parent, text, cmd, bg, fg, hl, width=4, padx=(0, 6)):
+    return tk.Button(parent, text=text, width=width, command=cmd,
+                     bg=bg, fg=fg, relief="flat", padx=2, pady=2,
+                     activebackground=hl, activeforeground=fg)
+
+
+def _combo(parent, var, values, cb, width=5):
+    c = ttk.Combobox(parent, textvariable=var, values=values,
+                     state="readonly", width=width, font=("Sans", 10))
+    c.bind("<<ComboboxSelected>>", cb)
+    return c
+
+
 class Card:
     def __init__(self, parent, dev, on_change):
         self.dev = dev
         self.on_change = on_change
+        self.on_key, self.lv_key = "on", "high"   # key 驱动状态（C10）
         th = theme()
         self.frame = tk.LabelFrame(
             parent, text=" " + _dev_label(dev) + " ",
@@ -640,58 +658,51 @@ class Card:
         )
         self.frame.pack(fill="x", padx=14, pady=6)
 
-        r1 = tk.Frame(self.frame, bg=th["CARD_BG"])
-        r1.pack(fill="x")
-        tk.Label(r1, text=t("switch"), bg=th["CARD_BG"], fg=th["FG_DIM"],
-                 font=("Sans", 10)).pack(side="left")
+        r1 = tk.Frame(self.frame, bg=th["CARD_BG"]); r1.pack(fill="x")
+        _lbl(r1, t("switch"), th["CARD_BG"], th["FG_DIM"]).pack(side="left")
         self.sw_var = tk.StringVar(value=t("on"))
-        self.sw = ttk.Combobox(r1, textvariable=self.sw_var,
-                               values=[t("on"), t("off")],
-                               state="readonly", width=5, font=("Sans", 10))
+        self.sw = _combo(r1, self.sw_var, [t("on"), t("off")], self._toggle)
         self.sw.pack(side="right")
-        self.sw.bind("<<ComboboxSelected>>", self._toggle)
 
-        r2 = tk.Frame(self.frame, bg=th["CARD_BG"])
-        r2.pack(fill="x", pady=(8, 0))
-        tk.Label(r2, text=t("brightness"), bg=th["CARD_BG"], fg=th["FG_DIM"],
-                 font=("Sans", 10)).pack(side="left")
+        r2 = tk.Frame(self.frame, bg=th["CARD_BG"]); r2.pack(fill="x", pady=(8, 0))
+        _lbl(r2, t("brightness"), th["CARD_BG"], th["FG_DIM"]).pack(side="left")
         self.lv_var = tk.StringVar(value=t("high"))
-        self.lv = ttk.Combobox(r2, textvariable=self.lv_var,
-                               values=[t(x) for x in LEVELS],
-                               state="readonly", width=5, font=("Sans", 10))
+        self.lv = _combo(r2, self.lv_var, [t(x) for x in LEVELS], self._level)
         self.lv.pack(side="right")
-        self.lv.bind("<<ComboboxSelected>>", self._level)
 
-        r3 = tk.Frame(self.frame, bg=th["CARD_BG"])
-        r3.pack(fill="x", pady=(10, 0))
-        self.btns = {}
-        for code in LEVELS:
-            b = tk.Button(r3, text=t(code), width=4,
-                          command=lambda c=code: self.on_change(self.dev, "level", c),
-                          bg=th["BTN_BG"], fg=th["FG"], relief="flat",
-                          padx=2, pady=2, activebackground=th["HL_BG"],
-                          activeforeground=th["FG"])
+        r3 = tk.Frame(self.frame, bg=th["CARD_BG"]); r3.pack(fill="x", pady=(10, 0))
+        self.btns = {code: _btn(
+            r3, t(code),
+            lambda c=code: self.on_change(self.dev, "level", c),
+            th["BTN_BG"], th["FG"], th["HL_BG"]) for code in LEVELS}
+        for b in self.btns.values():
             b.pack(side="left", padx=(0, 6))
-            self.btns[code] = b
 
-        self.path_lbl = tk.Label(self.frame, text="", bg=th["CARD_BG"],
-                                 fg=th["FG_DIM"], font=("Mono", 8), anchor="w")
+        self.path_lbl = _lbl(self.frame, "", th["CARD_BG"], th["FG_DIM"],
+                             font=("Mono", 8))
+        self.path_lbl.config(anchor="w")
         self.path_lbl.pack(fill="x", pady=(8, 0))
 
-        self.badge = tk.Label(self.frame, text="", bg=th["CARD_BG"],
-                              fg=th["FG_OK"], font=("Sans", 9, "bold"),
-                              anchor="w")
+        self.badge = _lbl(self.frame, "", th["CARD_BG"], th["FG_OK"],
+                          font=("Sans", 9, "bold"))
+        self.badge.config(anchor="w")
         self.badge.pack(fill="x", pady=(4, 0))
 
     def _toggle(self, _e=None):
-        self.on_change(self.dev, "toggle", self.sw_var.get() == t("on"))
+        self.on_key = "on" if self.sw_var.get() == t("on") else "off"
+        self.on_change(self.dev, "toggle", self.on_key == "on")
 
     def _level(self, _e=None):
-        inv = {t(x): x for x in LEVELS}
-        self.on_change(self.dev, "level", inv.get(self.lv_var.get(), "high"))
+        # 由当前显示文本反查 key（值集顺序与 LEVELS 一致）
+        idx = [t(x) for x in LEVELS].index(self.lv_var.get()) \
+            if self.lv_var.get() in [t(x) for x in LEVELS] else 3
+        self.lv_key = LEVELS[idx]
+        self.on_change(self.dev, "level", self.lv_key)
 
     def set_state(self, on, level):
-        self.sw_var.set(t("on") if on else t("off"))
+        self.on_key = "on" if on else "off"
+        self.lv_key = level
+        self.sw_var.set(t(self.on_key))
         self.lv_var.set(t(level))
         th = theme()
         self.badge.config(
@@ -703,17 +714,12 @@ class Card:
             text=t("hidraw_detected", p=path) if path else t("hidraw_missing"))
 
     def retranslate(self):
-        inv_on = {"开": "on", "On": "on", "关": "off", "Off": "off"}
-        inv_lv = {"高": "high", "High": "high", "中": "medium", "Medium": "medium",
-                  "低": "low", "Low": "low", "关": "off", "Off": "off"}
-        on_key = inv_on.get(self.sw_var.get(), "on")
-        lv_key = inv_lv.get(self.lv_var.get(), "high")
-        self.frame.config(text=" " + t("rear_name" if self.dev == "rear" else "kbd_name") + " ")
+        self.frame.config(text=" " + _dev_label(self.dev) + " ")
         self.sw.config(values=[t("on"), t("off")])
         self.lv.config(values=[t(x) for x in LEVELS])
         for code, b in self.btns.items():
             b.config(text=t(code))
-        self.set_state(on_key == "on", lv_key)
+        self.set_state(self.on_key == "on", self.lv_key)
 
 
 
