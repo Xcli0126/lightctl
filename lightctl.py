@@ -19,6 +19,7 @@ lightctl — ROG Flow Z13 (GZ302EA) 灯光控制 GUI
 import ctypes
 import ctypes.util
 import glob
+import io
 import json
 import os
 import sys
@@ -454,7 +455,6 @@ def _make_icon_bytes(state="on", size=64):
         d.ellipse([s - 16, 4, s - 4, 16], fill="#f38ba8")
     else:
         d.ellipse([s - 16, 4, s - 4, 16], fill="#a6e3a1")
-    import io
     buf = io.BytesIO()
     img.save(buf, format="PNG")
     return buf.getvalue()
@@ -463,19 +463,15 @@ def _make_icon_bytes(state="on", size=64):
 _ICON_CACHE = {}
 
 
-def get_icon(state="on", size=64):
-    key = (state, size)
-    if key not in _ICON_CACHE:
-        _ICON_CACHE[key] = _make_icon_bytes(state, size)
-    return _ICON_CACHE[key]
-
-
 def _icon_path(state="on", size=64):
-    """图标 PNG 路径；已存在则直接返回，避免每次刷新重写磁盘（P11）。"""
+    """图标 PNG 路径；命中缓存/磁盘则直接返回（P11，C1 合并 get_icon）。"""
+    key = (state, size)
     path = os.path.join(CONFIG_DIR, f"icon_{state}_{size}.png")
     if os.path.exists(path) and os.path.getsize(path) > 0:
         return path
-    data = get_icon(state, size)
+    if key not in _ICON_CACHE:
+        _ICON_CACHE[key] = _make_icon_bytes(state, size)
+    data = _ICON_CACHE[key]
     if not data:
         return None
     try:
