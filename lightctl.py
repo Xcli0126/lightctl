@@ -172,6 +172,18 @@ def t(key, **kw):
     return s
 
 
+def _i18n_check():
+    """S5: zh/en key sets match, and every t() literal exists."""
+    import re as _re
+    zh, en = set(_STRINGS["zh"]), set(_STRINGS["en"])
+    if zh != en:
+        raise AssertionError("i18n mismatch")
+    src = open(__file__, encoding="utf-8").read()
+    for m in _re.findall(r'(?<![A-Za-z_.])t\(\s*"([a-z_0-9]+)"', src):
+        if m not in zh:
+            raise AssertionError("missing i18n key: " + m)
+
+
 def _dev_label(dev):
     """设备名 → 当前语言标签（模块级，Backend/Card/App 共用）。"""
     return t("rear_name" if dev == "rear" else "kbd_name")
@@ -1113,6 +1125,8 @@ class App(tk.Tk):
 # ---------- 自测 ----------
 def selftest():
     """不开 GUI 验证链路：找设备 → 关后盖(键盘不动) → 开后盖 → 关键盘 → 全开。"""
+    _i18n_check()
+    print("OK   i18n keys consistent")
     b = Backend()
     nodes = b.list_nodes()
     print("节点:", nodes)
