@@ -907,6 +907,10 @@ class App(tk.Tk):
 
     def _exec(self, dev, on, level):
         if self._busy:
+            # 忙时回滚 UI 到已知状态，避免界面与硬件脱节（P6）
+            st = self.state.get(dev, {"on": True, "level": "high"})
+            self.cards[dev].set_state(st.get("on", True), st.get("level", "high"))
+            self.log_lbl.config(text=t("executing"))
             return
         self._busy = True
         self.log_lbl.config(text=t("executing"))
@@ -935,9 +939,14 @@ class App(tk.Tk):
 
     def _all(self, on):
         if self._busy:
+            for d in DEVICES:
+                st = self.state.get(d, {"on": True, "level": "high"})
+                self.cards[d].set_state(st.get("on", True), st.get("level", "high"))
+            self.log_lbl.config(text=t("executing"))
             return
         self._busy = True
-        self.log_lbl.config(text=t("all_on_msg") if on else t("all_off_msg"))
+        # 进行中用 executing，不用完成文案（P7）
+        self.log_lbl.config(text=t("executing"))
         lvl = 3 if on else 0
         level_key = "high" if on else "off"
 
