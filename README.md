@@ -2,6 +2,15 @@
 
 ROG Flow Z13 (GZ302EA) 灯光控制 GUI —— 独立开关背光（后部灯条）和键盘灯，互不干扰。
 
+## 功能
+
+- 两路独立开关 + 键盘灯 4 档亮度，互不干扰（关后盖不灭键盘）
+- **状态栏（托盘）常驻**：图标随灯光状态变色（绿=全开 / 红=全关 / 橙=部分），菜单可直接开关两路灯
+- **设置**：界面语言（中/英）、主题（深色/浅色）、托盘开关、开机自启动，全部即时生效
+- 窗口图标 + 托盘图标由 PIL 程序化绘制（灯泡 + 状态点），无外部图片资源
+- 关窗自动隐藏到托盘（托盘开启时），从托盘菜单退出
+- `--selftest` 不开 GUI 验证全链路，`--version` 看版本
+
 ## 解决什么问题
 
 这台机器有两路独立的 Aura 灯光，各自是独立的 USB HID 设备：
@@ -22,7 +31,7 @@ ROG Flow Z13 (GZ302EA) 灯光控制 GUI —— 独立开关背光（后部灯条
 - **roguex** —— C++/GTK，重
 - **AsusTUFBacklitColorChanger** —— 走 sysfs `kbd_rgb_mode`，Z13 没这个节点（实测为空），且全程 `pkexec`
 
-lightctl 取了 g-helper 的协议精华（按 PID 路由 + 按位 power），用纯 Python 单文件实现，零第三方依赖。
+lightctl 取了 g-helper 的协议精华（按 PID 路由 + 按位 power），核心用纯 Python 单文件实现，无 z13ctl/.NET/C++ 依赖；托盘和图标用了 PyGObject/Pillow，缺失时自动降级不影响主功能。
 
 ## 实现要点
 
@@ -58,6 +67,8 @@ python3 lightctl.py
 - **亮度**下拉 + **关/低/中/高**快捷按钮：键盘灯 4 档；后盖灯只响应开关（它没有亮度概念，是独立 mode/color 设备）
 - **全部打开 / 全部关闭**：两路一起
 - **刷新状态**：重新扫描 hidraw 设备（磁吸键盘重插后用）
+- **⚙ 设置**：切换语言、主题、托盘常驻、开机自启
+- 托盘图标：左键点菜单开关两路灯 / 显示主窗口 / 打开设置 / 退出；主窗口关闭时最小化到托盘
 
 ## 自测
 
@@ -85,7 +96,7 @@ OK   全开: 全部已打开
 ## 系统要求
 
 - Linux + systemd（udev）
-- Python 3（只用标准库：tkinter / ctypes / json）
+- Python 3（tkinter / ctypes / json 标准库；托盘需 PyGObject + AyatanaAppIndicator3，图标需 Pillow，均非必需——缺失时自动降级）
 - ASUS ROG Flow Z13 2025 (GZ302EA)，其它机型的 Aura 设备理论上也走这套协议，但没实测
 
 ## 卸载

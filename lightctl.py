@@ -8,16 +8,14 @@ lightctl — ROG Flow Z13 (GZ302EA) 灯光控制 GUI
   键盘灯（keyboard,          USB 0b05:1a30, HIDID 0x1A30）
 
 实现方式：直接向 /dev/hidrawN 写 64 字节 Aura 输出报告（Report ID 0x5d），
-不再依赖 z13ctl 二进制。协议逆向自 g-helper (MIT) 与 z13ctl PROTOCOL.md。
+不依赖 z13ctl 二进制。协议逆向自 g-helper (MIT) 与 z13ctl PROTOCOL.md。
 
-设计要点（取自 g-helper-linux，修掉 z13ctl 的缺陷）：
-  1. 按 PID 路由：后盖只写 0x18C6，键盘只写 0x1A30，杜绝误伤。
-  2. Power 按位控制：[0x5D,0xBD,0x01,keyb,bar,lid,rear,0xFF]，
-     关后盖 = bar/lid/rear 清 0、keyb 保持 0xFF，键盘完全不受影响。
-  3. 后盖是独立 Aura 设备（PID 0x18C6），可单独设 mode/color。
-  4. udev 免 root（z13ctl setup 装的规则已覆盖两个 PID）。
+功能：
+  - 两路独立开关 + 键盘灯 4 档亮度
+  - 状态栏（托盘）常驻，图标随灯光状态变色，菜单可控
+  - 设置：界面语言（中/英）、托盘开关、开机自启、主题（深/浅）
+  - --selftest 不开 GUI 验证链路
 """
-
 import ctypes
 import ctypes.util
 import glob
@@ -30,7 +28,12 @@ import tkinter as tk
 from tkinter import ttk, messagebox
 
 APP_NAME = "lightctl"
-STATE_FILE = os.path.expanduser("~/.config/lightctl/state.json")
+APP_VERSION = "1.1.0"
+CONFIG_DIR = os.path.expanduser("~/.config/lightctl")
+STATE_FILE = os.path.join(CONFIG_DIR, "state.json")
+SETTINGS_FILE = os.path.join(CONFIG_DIR, "settings.json")
+AUTOSTART_FILE = os.path.expanduser(
+    "~/.config/autostart/lightctl.desktop")
 
 # Aura 协议常量
 AURA_ID = 0x5D
@@ -38,25 +41,271 @@ HIDIOCGRDESCSIZE = 0x80044801
 HIDIOCGRDESC = 0x90044802
 REPORT_SIZE = 64
 
-# USB Product ID -> 逻辑设备名
 PID_REAR = "18C6"
 PID_KEYBOARD = "1A30"
 DEVICES = ("rear", "keyboard")
-DEVICE_ZH = {"rear": "背光（后部灯条）", "keyboard": "键盘灯"}
 
 LEVELS = ["off", "low", "medium", "high"]
-LEVEL_ZH = {"off": "关", "low": "低", "medium": "中", "high": "高"}
-ZH_LEVEL = {v: k for k, v in LEVEL_ZH.items()}
 
-BG = "#1e1e2e"
-CARD_BG = "#313244"
-BTN_BG = "#45475a"
-FG = "#cdd6f4"
-FG_DIM = "#a6adc8"
-FG_OK = "#a6e3a1"
-FG_ERR = "#f38ba8"
-FG_INFO = "#89b4fa"
+# 主题配色
+THEMES = {
+    "dark": {
+        "BG": "#1e1e2e", "CARD_BG": "#313244", "BTN_BG": "#45475a",
+        "FG": "#cdd6f4", "FG_DIM": "#a6adc8", "FG_OK": "#a6e3a1",
+        "FG_ERR": "#f38ba8", "FG_INFO": "#89b4fa",
+        "ACCENT": "#89b4fa", "ENTRY_BG": "#45475a",
+        "HL_BG": "#45475a", "SELECT": "#585b70",
+    },
+    "light": {
+        "BG": "#eff1f5", "CARD_BG": "#e6e9ef", "BTN_BG": "#dce0e8",
+        "FG": "#4c4f69", "FG_DIM": "#6c6f85", "FG_OK": "#40a02b",
+        "FG_ERR": "#d20f39", "FG_INFO": "#1e66f5",
+        "ACCENT": "#1e66f5", "ENTRY_BG": "#ffffff",
+        "HL_BG": "#dce0e8", "SELECT": "#ccd0da",
+    },
+}
 
+# ---------- i18n ----------
+_STRINGS = {
+    "zh": {
+        "app_title": "lightctl — Z13 灯光控制",
+        "backend": "后端：Aura HID 直写（按 PID 路由）",
+        "no_backend": "未找到可用的 Aura 设备",
+        "rear_name": "背光（后部灯条）",
+        "kbd_name": "键盘灯",
+        "switch": "开关",
+        "brightness": "亮度",
+        "on": "开", "off": "关",
+        "low": "低", "medium": "中", "high": "高",
+        "all_on": "全部打开", "all_off": "全部关闭",
+        "refresh": "刷新状态", "settings": "设置",
+        "status_fmt": "Aura 接口 {n}/2：{list}",
+        "missing": "（缺: {m}）",
+        "hidraw_detected": "hidraw: {p}",
+        "hidraw_missing": "hidraw: 未检测到",
+        "executing": "执行中…",
+        "all_on_msg": "全部已打开", "all_off_msg": "全部已关闭",
+        "fail": "失败：{m}",
+        "settings_title": "设置",
+        "language": "界面语言",
+        "tray": "状态栏（托盘）常驻",
+        "autostart": "开机自启动",
+        "theme": "主题",
+        "theme_dark": "深色", "theme_light": "浅色",
+        "save": "保存", "cancel": "取消",
+        "close": "关闭", "quit": "退出",
+        "show_win": "显示主窗口", "hide_win": "隐藏主窗口",
+        "tray_tip": "lightctl 灯光控制",
+        "tray_on": "灯光已开", "tray_off": "灯光已关",
+        "tray_partial": "部分灯光已关",
+        "err_no_dev": "未找到 Aura 设备，请检查 udev 规则。",
+        "err_generic": "操作失败",
+        "autostart_on": "已开启开机自启", "autostart_off": "已关闭开机自启",
+        "need_restart": "语言/主题改动即时生效",
+        "version": "版本",
+        "about": "关于",
+        "ok": "确定",
+    },
+    "en": {
+        "app_title": "lightctl — Z13 Lighting Control",
+        "backend": "Backend: Aura HID direct write (per-PID routing)",
+        "no_backend": "No Aura device found",
+        "rear_name": "Rear glow (light bar)",
+        "kbd_name": "Keyboard backlight",
+        "switch": "Switch",
+        "brightness": "Brightness",
+        "on": "On", "off": "Off",
+        "low": "Low", "medium": "Medium", "high": "High",
+        "all_on": "All on", "all_off": "All off",
+        "refresh": "Refresh", "settings": "Settings",
+        "status_fmt": "Aura interfaces {n}/2: {list}",
+        "missing": " (missing: {m})",
+        "hidraw_detected": "hidraw: {p}",
+        "hidraw_missing": "hidraw: not detected",
+        "executing": "Working…",
+        "all_on_msg": "All lights on", "all_off_msg": "All lights off",
+        "fail": "Failed: {m}",
+        "settings_title": "Settings",
+        "language": "Language",
+        "tray": "Keep in system tray",
+        "autostart": "Start on login",
+        "theme": "Theme",
+        "theme_dark": "Dark", "theme_light": "Light",
+        "save": "Save", "cancel": "Cancel",
+        "close": "Close", "quit": "Quit",
+        "show_win": "Show main window", "hide_win": "Hide main window",
+        "tray_tip": "lightctl lighting control",
+        "tray_on": "Lights on", "tray_off": "Lights off",
+        "tray_partial": "Some lights off",
+        "err_no_dev": "No Aura device found. Check udev rules.",
+        "err_generic": "Operation failed",
+        "autostart_on": "Autostart enabled", "autostart_off": "Autostart disabled",
+        "need_restart": "Language/theme changes apply immediately",
+        "version": "Version",
+        "about": "About",
+        "ok": "OK",
+    },
+}
+# ---------- i18n ----------
+_LANG = "zh"
+_THEME = "dark"
+_STRINGS = {
+    "zh": {
+        "app_title": "lightctl — Z13 灯光控制",
+        "backend": "后端：Aura HID 直写（按 PID 路由）",
+        "no_backend": "未找到可用的 Aura 设备",
+        "rear_name": "背光（后部灯条）",
+        "kbd_name": "键盘灯",
+        "switch": "开关",
+        "brightness": "亮度",
+        "on": "开", "off": "关",
+        "low": "低", "medium": "中", "high": "高",
+        "all_on": "全部打开", "all_off": "全部关闭",
+        "refresh": "刷新状态", "settings": "设置",
+        "status_fmt": "Aura 接口 {n}/2：{list}",
+        "missing": "（缺: {m}）",
+        "hidraw_detected": "hidraw: {p}",
+        "hidraw_missing": "hidraw: 未检测到",
+        "executing": "执行中…",
+        "all_on_msg": "全部已打开", "all_off_msg": "全部已关闭",
+        "fail": "失败：{m}",
+        "settings_title": "设置",
+        "language": "界面语言",
+        "tray": "状态栏（托盘）常驻",
+        "autostart": "开机自启动",
+        "theme": "主题",
+        "theme_dark": "深色", "theme_light": "浅色",
+        "save": "保存", "cancel": "取消",
+        "close": "关闭", "quit": "退出",
+        "show_win": "显示主窗口", "hide_win": "隐藏主窗口",
+        "tray_on": "灯光已开", "tray_off": "灯光已关",
+        "tray_partial": "部分灯光已关",
+        "err_no_dev": "未找到 Aura 设备，请检查 udev 规则。",
+        "version": "版本",
+        "rear_zone": "后盖灯", "kbd_zone": "键盘灯",
+        "state_on": "开", "state_off": "关",
+    },
+    "en": {
+        "app_title": "lightctl — Z13 Lighting Control",
+        "backend": "Backend: Aura HID direct write (per-PID routing)",
+        "no_backend": "No Aura device found",
+        "rear_name": "Rear glow (light bar)",
+        "kbd_name": "Keyboard backlight",
+        "switch": "Switch",
+        "brightness": "Brightness",
+        "on": "On", "off": "Off",
+        "low": "Low", "medium": "Medium", "high": "High",
+        "all_on": "All on", "all_off": "All off",
+        "refresh": "Refresh", "settings": "Settings",
+        "status_fmt": "Aura interfaces {n}/2: {list}",
+        "missing": " (missing: {m})",
+        "hidraw_detected": "hidraw: {p}",
+        "hidraw_missing": "hidraw: not detected",
+        "executing": "Working…",
+        "all_on_msg": "All lights on", "all_off_msg": "All lights off",
+        "fail": "Failed: {m}",
+        "settings_title": "Settings",
+        "language": "Language",
+        "tray": "Keep in system tray",
+        "autostart": "Start on login",
+        "theme": "Theme",
+        "theme_dark": "Dark", "theme_light": "Light",
+        "save": "Save", "cancel": "Cancel",
+        "close": "Close", "quit": "Quit",
+        "show_win": "Show main window", "hide_win": "Hide main window",
+        "tray_on": "Lights on", "tray_off": "Lights off",
+        "tray_partial": "Some lights off",
+        "err_no_dev": "No Aura device found. Check udev rules.",
+        "version": "Version",
+        "rear_zone": "Rear", "kbd_zone": "Keyboard",
+        "state_on": "On", "state_off": "Off",
+    },
+}
+
+
+def t(key, **kw):
+    s = _STRINGS.get(_LANG, _STRINGS["zh"]).get(key, key)
+    if kw:
+        try:
+            return s.format(**kw)
+        except Exception:
+            return s
+    return s
+
+
+def set_lang(lang):
+    global _LANG
+    _LANG = lang if lang in _STRINGS else "zh"
+
+
+def set_theme(name):
+    global _THEME
+    _THEME = name if name in THEMES else "dark"
+
+
+def theme():
+    return THEMES[_THEME]
+# ---------- 配置持久化 ----------
+def _read_json(path, default):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            v = json.load(f)
+            if isinstance(v, dict):
+                return v
+    except Exception:
+        pass
+    return default
+
+
+def _write_json(path, data):
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
+def load_settings():
+    return _read_json(SETTINGS_FILE, {})
+
+
+def save_settings(s):
+    _write_json(SETTINGS_FILE, s)
+
+
+def load_state():
+    return _read_json(STATE_FILE, {})
+
+
+def save_state(s):
+    _write_json(STATE_FILE, s)
+
+
+def set_autostart(enabled):
+    try:
+        if enabled:
+            os.makedirs(os.path.dirname(AUTOSTART_FILE), exist_ok=True)
+            exe = os.path.abspath(sys.argv[0])
+            content = (
+                "[Desktop Entry]\nType=Application\nName=lightctl\n"
+                f"Exec=python3 {exe}\nTerminal=false\n"
+                "X-GNOME-Autostart-enabled=true\nStartupNotify=true\n"
+            )
+            with open(AUTOSTART_FILE, "w", encoding="utf-8") as f:
+                f.write(content)
+        elif os.path.exists(AUTOSTART_FILE):
+            os.remove(AUTOSTART_FILE)
+        return True
+    except Exception:
+        return False
+
+
+def autostart_enabled():
+    return os.path.exists(AUTOSTART_FILE)
+
+
+# ---------- 协议层 ----------
 _libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
 
 
@@ -65,7 +314,6 @@ class _Desc(ctypes.Structure):
 
 
 def _has_aura(fd):
-    """检查该 hidraw 节点的报告描述符里有没有 Aura Report ID 0x5d。"""
     sz = ctypes.c_uint32(0)
     if _libc.ioctl(fd, HIDIOCGRDESCSIZE, ctypes.byref(sz)) != 0:
         return False
@@ -79,7 +327,6 @@ def _has_aura(fd):
 
 
 def find_aura_nodes():
-    """扫描 /sys/class/hidraw，按 PID 分类返回 {dev: path}，只含带 Aura 的节点。"""
     out = {}
     for ue in sorted(glob.glob("/sys/class/hidraw/hidraw*/device/uevent")):
         try:
@@ -110,7 +357,6 @@ def find_aura_nodes():
 
 
 def _pkt(*body):
-    """构造 64 字节 Aura 输出报告，首字节为 Report ID 0x5d。"""
     b = bytearray(REPORT_SIZE)
     b[0] = AURA_ID
     for i, x in enumerate(body, 1):
@@ -119,23 +365,11 @@ def _pkt(*body):
 
 
 class AuraDevice:
-    """一个 Aura HID 设备（按 PID 打开的单个 hidraw 节点）。"""
-
     def __init__(self, path):
         self.path = path
 
-    def _open(self):
-        return os.open(self.path, os.O_RDWR)
-
-    def _write(self, data):
-        fd = self._open()
-        try:
-            os.write(fd, data)
-        finally:
-            os.close(fd)
-
     def _write_seq(self, packets):
-        fd = self._open()
+        fd = os.open(self.path, os.O_RDWR)
         try:
             for p in packets:
                 os.write(fd, p)
@@ -144,7 +378,6 @@ class AuraDevice:
             os.close(fd)
 
     def init(self):
-        """Aura 初始化序列（唤醒 + 识别 + 配置 + Z13 动态灯效）。"""
         self._write_seq([
             _pkt(0xB9),
             b"]ASUS Tech.Inc.",
@@ -153,35 +386,26 @@ class AuraDevice:
         ])
 
     def set_power(self, keyb, bar, lid, rear):
-        """按位设置 power 区。关后盖时 bar/lid/rear=0、keyb=0xFF。"""
-        self._write(_pkt(0xBD, 0x01, keyb, bar, lid, rear, 0xFF))
+        fd = os.open(self.path, os.O_RDWR)
+        try:
+            os.write(fd, _pkt(0xBD, 0x01, keyb, bar, lid, rear, 0xFF))
+        finally:
+            os.close(fd)
 
     def set_brightness(self, level):
-        """设置亮度 0-3（只对键盘设备有意义，后盖设备忽略）。"""
-        self._write(_pkt(0xBA, 0xC5, 0xC4, level))
-
-    def set_mode(self, zone, mode, r, g, b, r2=0, g2=0, b2=0,
-                 speed=0xEB, rand=0):
-        """设置某 zone 的颜色/模式，随后 commit（SET + APPLY）。"""
-        if r == 0 and g == 0 and b == 0 and mode != 1:
-            rand = 0xFF
-        elif mode == 1:
-            rand = 0x01
-        self._write_seq([
-            _pkt(0xB3, zone, mode, r, g, b, speed, 0x00, rand, r2, g2, b2),
-            _pkt(0xB5),
-            _pkt(0xB4),
-        ])
+        fd = os.open(self.path, os.O_RDWR)
+        try:
+            os.write(fd, _pkt(0xBA, 0xC5, 0xC4, level))
+        finally:
+            os.close(fd)
 
     def turn_off(self):
-        """关掉这个设备控制的灯：power 全关 + 亮度 0。"""
         self.init()
         time.sleep(0.05)
         self.set_power(0x00, 0x00, 0x00, 0x00)
         self.set_brightness(0)
 
     def turn_on(self, level=3):
-        """打开这个设备：power 全开 + 恢复亮度。"""
         self.init()
         time.sleep(0.05)
         self.set_power(0xFF, 0x1F, 0xFF, 0xFF)
@@ -189,8 +413,6 @@ class AuraDevice:
 
 
 class Backend:
-    """按 PID 路由到具体 Aura 设备，串行执行避免并发写。"""
-
     def __init__(self):
         self._lock = threading.Lock()
         self.nodes = find_aura_nodes()
@@ -200,34 +422,27 @@ class Backend:
             self.nodes = find_aura_nodes()
         return self.nodes
 
-    def _dev(self, name):
-        path = self.nodes.get(name)
-        if not path:
-            return None
-        return AuraDevice(path)
-
     def set_device(self, name, on, level=3):
-        """开/关单个设备。name in DEVICES。"""
         with self._lock:
             if name not in self.nodes:
-                return False, f"未找到 {name} 设备"
+                return False, t("err_no_dev")
             dev = AuraDevice(self.nodes[name])
             try:
                 if on:
                     dev.turn_on(level)
                 else:
                     dev.turn_off()
-                return True, f"{DEVICE_ZH.get(name, name)} → {'开' if on else '关'}"
+                label = t("rear_name" if name == "rear" else "kbd_name")
+                return True, f"{label} → {t('state_on' if on else 'state_off')}"
             except OSError as e:
                 return False, str(e)
 
     def set_all(self, on, level=3):
-        """开/关全部设备，返回 (ok, msg)。"""
         errs = []
         with self._lock:
             for name in DEVICES:
                 if name not in self.nodes:
-                    errs.append(f"缺 {name}")
+                    errs.append(name)
                     continue
                 dev = AuraDevice(self.nodes[name])
                 try:
@@ -239,140 +454,490 @@ class Backend:
                     errs.append(f"{name}: {e}")
         if errs:
             return False, "; ".join(errs)
-        return True, "全部已打开" if on else "全部已关闭"
+        return True, t("all_on_msg") if on else t("all_off_msg")
 
     def list_nodes(self):
         with self._lock:
             return dict(self.nodes)
-
-
-def load_state():
+# ---------- 图标（PIL 程序化绘制） ----------
+def _make_icon_bytes(state="on", size=64):
+    """画一个灯泡/灯条图标，返回 PNG bytes。state: on/off/partial。"""
     try:
-        with open(STATE_FILE, "r", encoding="utf-8") as f:
-            s = json.load(f)
-            if isinstance(s, dict):
-                return s
+        from PIL import Image, ImageDraw
     except Exception:
-        pass
-    return {}
+        return None
+    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    s = size
+    if state == "on":
+        glow, body, base = "#ffd166", "#ffe9a8", "#f4a261"
+    elif state == "off":
+        glow, body, base = "#45475a", "#585b70", "#313244"
+    else:
+        glow, body, base = "#f9e2af", "#fab387", "#a6520a"
+    cx, cy = s // 2, int(s * 0.42)
+    r = int(s * 0.26)
+    # 光晕
+    for gr in range(r + int(s * 0.16), r, -3):
+        a = max(0, min(255, int(70 * (1 - (gr - r) / (s * 0.16)))))
+        d.ellipse([cx - gr, cy - gr, cx + gr, cy + gr],
+                  fill=(255, 209, 102, a) if state == "on" else (0, 0, 0, 0))
+    # 灯泡身
+    d.ellipse([cx - r, cy - r, cx + r, cy + r], fill=body, outline=glow, width=2)
+    # 灯座
+    bw, bh = int(r * 0.9), int(r * 0.5)
+    by = cy + r - 2
+    d.rounded_rectangle([cx - bw // 2, by, cx + bw // 2, by + bh],
+                        radius=3, fill=base, outline=glow, width=1)
+    # 灯丝
+    d.line([(cx - int(r * 0.3), cy - int(r * 0.1)),
+            (cx, cy + int(r * 0.2)),
+            (cx + int(r * 0.3), cy - int(r * 0.1))],
+           fill=glow if state != "off" else "#6c6f85", width=2)
+    # 状态点
+    if state == "off":
+        d.ellipse([s - 16, 4, s - 4, 16], fill="#f38ba8")
+    else:
+        d.ellipse([s - 16, 4, s - 4, 16], fill="#a6e3a1")
+    import io
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
 
 
-def save_state(s):
+_ICON_CACHE = {}
+
+
+def get_icon(state="on", size=64):
+    key = (state, size)
+    if key not in _ICON_CACHE:
+        _ICON_CACHE[key] = _make_icon_bytes(state, size)
+    return _ICON_CACHE[key]
+
+
+def _icon_path(state="on", size=64):
+    """把图标写到临时文件，返回路径（供 PhotoImage / 托盘用）。"""
+    data = get_icon(state, size)
+    if not data:
+        return None
+    path = os.path.join(CONFIG_DIR, f"icon_{state}_{size}.png")
     try:
-        os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
-        with open(STATE_FILE, "w", encoding="utf-8") as f:
-            json.dump(s, f, ensure_ascii=False, indent=2)
+        os.makedirs(CONFIG_DIR, exist_ok=True)
+        with open(path, "wb") as f:
+            f.write(data)
+        return path
     except Exception:
-        pass
+        return None
 
 
+# ---------- 托盘（AyatanaAppIndicator3 + GTK3 主循环线程） ----------
+def _tray_available():
+    try:
+        import gi
+        gi.require_version("Gtk", "3.0")
+        gi.require_version("AyatanaAppIndicator3", "0.1")
+        from gi.repository import AyatanaAppIndicator3  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
+class Tray:
+    """系统托盘图标。在独立线程跑 GTK 主循环。"""
+
+    def __init__(self, app):
+        self.app = app
+        self.ind = None
+        self.menu = None
+        self._available = _tray_available()
+        self._thread = None
+        self._state = "on"
+
+    def start(self):
+        if not self._available or self.ind is not None:
+            return
+        import gi
+        gi.require_version("Gtk", "3.0")
+        gi.require_version("AyatanaAppIndicator3", "0.1")
+        from gi.repository import Gtk, GLib, AyatanaAppIndicator3 as AppInd
+
+        def _build():
+            self._Gtk = Gtk
+            self._GLib = GLib
+            ind = AppInd.Indicator.new(
+                "lightctl", "preferences-desktop-display",
+                AppInd.IndicatorCategory.HARDWARE)
+            ind.set_status(AppInd.IndicatorStatus.ACTIVE)
+            ind.set_title(t("tray_tip") if False else APP_NAME)
+            menu = Gtk.Menu()
+
+            def _mi(label, cb):
+                item = Gtk.MenuItem.new_with_label(label)
+                item.connect("activate", cb)
+                menu.append(item)
+                return item
+
+            self.mi_rear = _mi(t("rear_zone"), self._on_rear)
+            self.mi_kbd = _mi(t("kbd_zone"), self._on_kbd)
+            menu.append(Gtk.SeparatorMenuItem())
+            self.mi_show = _mi(t("show_win"), self._on_show)
+            _mi(t("settings"), self._on_settings)
+            menu.append(Gtk.SeparatorMenuItem())
+            _mi(t("quit"), self._on_quit)
+            menu.show_all()
+            ind.set_menu(menu)
+            self.ind = ind
+            self.menu = menu
+            self._update_icon(self._state)
+
+        GLib.idle_add(_build)
+        self._thread = threading.Thread(target=Gtk.main, daemon=True)
+        self._thread.start()
+
+    def _call(self, fn):
+        """在 GTK 线程执行 fn。"""
+        if self._GLib is not None:
+            self._GLib.idle_add(fn)
+
+    def _update_icon(self, state):
+        self._state = state
+        if not self.ind:
+            return
+        path = _icon_path(state, 48)
+        def _do():
+            if path:
+                self.ind.set_icon_full(path, APP_NAME)
+            self._refresh_labels()
+            return False
+        self._call(_do)
+
+    def _refresh_labels(self):
+        # 用菜单项标签反映当前状态
+        st = self.app.state
+        def _do():
+            try:
+                rear_on = st.get("rear", {}).get("on", True)
+                kbd_on = st.get("keyboard", {}).get("on", True)
+                self.mi_rear.set_label(
+                    f"{t('rear_zone')}: {t('state_on' if rear_on else 'state_off')}")
+                self.mi_kbd.set_label(
+                    f"{t('kbd_zone')}: {t('state_on' if kbd_on else 'state_off')}")
+            except Exception:
+                pass
+            return False
+        self._call(_do)
+
+    def _on_rear(self, *_):
+        self.app.toggle_from_tray("rear")
+
+    def _on_kbd(self, *_):
+        self.app.toggle_from_tray("keyboard")
+
+    def _on_show(self, *_):
+        self.app.show_window()
+
+    def _on_settings(self, *_):
+        self.app.show_window()
+        self.app.open_settings()
+
+    def _on_quit(self, *_):
+        self.app.quit()
+
+    def stop(self):
+        if self.ind is None:
+            return
+        ind, self.ind = self.ind, None
+        Gtk, GLib = getattr(self, "_Gtk", None), getattr(self, "_GLib", None)
+        if GLib is None or Gtk is None:
+            return
+
+        def _do():
+            try:
+                from gi.repository import AyatanaAppIndicator3 as AppInd
+                ind.set_status(AppInd.IndicatorStatus.PASSIVE)
+            except Exception:
+                pass
+            try:
+                Gtk.main_quit()
+            except Exception:
+                pass
+            return False
+
+        GLib.idle_add(_do)
+
+
+
+# ---------- UI：控制卡 ----------
 class Card:
-    """一路灯光的控制卡。"""
-
     def __init__(self, parent, dev, on_change):
         self.dev = dev
         self.on_change = on_change
-
+        th = theme()
         self.frame = tk.LabelFrame(
-            parent, text=f" {DEVICE_ZH[dev]} ",
-            bg=CARD_BG, fg=FG, font=("Sans", 11, "bold"),
+            parent, text=" " + t("rear_name" if dev == "rear" else "kbd_name") + " ",
+            bg=th["CARD_BG"], fg=th["FG"], font=("Sans", 11, "bold"),
             padx=12, pady=10,
         )
         self.frame.pack(fill="x", padx=14, pady=6)
 
-        r1 = tk.Frame(self.frame, bg=CARD_BG)
+        r1 = tk.Frame(self.frame, bg=th["CARD_BG"])
         r1.pack(fill="x")
-        tk.Label(r1, text="开关", bg=CARD_BG, fg=FG_DIM,
+        tk.Label(r1, text=t("switch"), bg=th["CARD_BG"], fg=th["FG_DIM"],
                  font=("Sans", 10)).pack(side="left")
-        self.sw_var = tk.StringVar(value="开")
-        sw = ttk.Combobox(r1, textvariable=self.sw_var, values=["开", "关"],
-                          state="readonly", width=5, font=("Sans", 10))
-        sw.pack(side="right")
-        sw.bind("<<ComboboxSelected>>", self._toggle)
+        self.sw_var = tk.StringVar(value=t("on"))
+        self.sw = ttk.Combobox(r1, textvariable=self.sw_var,
+                               values=[t("on"), t("off")],
+                               state="readonly", width=5, font=("Sans", 10))
+        self.sw.pack(side="right")
+        self.sw.bind("<<ComboboxSelected>>", self._toggle)
 
-        r2 = tk.Frame(self.frame, bg=CARD_BG)
+        r2 = tk.Frame(self.frame, bg=th["CARD_BG"])
         r2.pack(fill="x", pady=(8, 0))
-        tk.Label(r2, text="亮度", bg=CARD_BG, fg=FG_DIM,
+        tk.Label(r2, text=t("brightness"), bg=th["CARD_BG"], fg=th["FG_DIM"],
                  font=("Sans", 10)).pack(side="left")
-        self.lv_var = tk.StringVar(value="高")
-        lv = ttk.Combobox(r2, textvariable=self.lv_var,
-                          values=[LEVEL_ZH[x] for x in LEVELS],
-                          state="readonly", width=5, font=("Sans", 10))
-        lv.pack(side="right")
-        lv.bind("<<ComboboxSelected>>", self._level)
+        self.lv_var = tk.StringVar(value=t("high"))
+        self.lv = ttk.Combobox(r2, textvariable=self.lv_var,
+                               values=[t(x) for x in LEVELS],
+                               state="readonly", width=5, font=("Sans", 10))
+        self.lv.pack(side="right")
+        self.lv.bind("<<ComboboxSelected>>", self._level)
 
-        r3 = tk.Frame(self.frame, bg=CARD_BG)
+        r3 = tk.Frame(self.frame, bg=th["CARD_BG"])
         r3.pack(fill="x", pady=(10, 0))
-        for txt, code in (("关", "off"), ("低", "low"), ("中", "medium"), ("高", "high")):
-            tk.Button(r3, text=txt, width=4,
-                      command=lambda c=code: self.on_change(self.dev, "level", c),
-                      bg=BTN_BG, fg=FG, relief="flat", padx=2, pady=2
-                      ).pack(side="left", padx=(0, 6))
+        self.btns = {}
+        for code in LEVELS:
+            b = tk.Button(r3, text=t(code), width=4,
+                          command=lambda c=code: self.on_change(self.dev, "level", c),
+                          bg=th["BTN_BG"], fg=th["FG"], relief="flat",
+                          padx=2, pady=2, activebackground=th["HL_BG"],
+                          activeforeground=th["FG"])
+            b.pack(side="left", padx=(0, 6))
+            self.btns[code] = b
 
-        # 设备路径显示
-        self.path_lbl = tk.Label(self.frame, text="", bg=CARD_BG, fg=FG_DIM,
-                                 font=("Mono", 8), anchor="w")
+        self.path_lbl = tk.Label(self.frame, text="", bg=th["CARD_BG"],
+                                 fg=th["FG_DIM"], font=("Mono", 8), anchor="w")
         self.path_lbl.pack(fill="x", pady=(8, 0))
 
-    def _toggle(self, _event=None):
-        self.on_change(self.dev, "toggle", self.sw_var.get() == "开")
+        self.badge = tk.Label(self.frame, text="", bg=th["CARD_BG"],
+                              fg=th["FG_OK"], font=("Sans", 9, "bold"),
+                              anchor="w")
+        self.badge.pack(fill="x", pady=(4, 0))
 
-    def _level(self, _event=None):
-        self.on_change(self.dev, "level", ZH_LEVEL.get(self.lv_var.get(), "high"))
+    def _toggle(self, _e=None):
+        self.on_change(self.dev, "toggle", self.sw_var.get() == t("on"))
+
+    def _level(self, _e=None):
+        inv = {t(x): x for x in LEVELS}
+        self.on_change(self.dev, "level", inv.get(self.lv_var.get(), "high"))
 
     def set_state(self, on, level):
-        self.sw_var.set("开" if on else "关")
-        self.lv_var.set(LEVEL_ZH.get(level, "高"))
+        self.sw_var.set(t("on") if on else t("off"))
+        self.lv_var.set(t(level))
+        th = theme()
+        self.badge.config(
+            text="● " + (t("state_on") if on else t("state_off")),
+            fg=th["FG_OK"] if on else th["FG_ERR"])
 
     def set_path(self, path):
-        self.path_lbl.config(text=f"hidraw: {path}" if path else "hidraw: 未检测到")
+        self.path_lbl.config(
+            text=t("hidraw_detected", p=path) if path else t("hidraw_missing"))
+
+    def retranslate(self):
+        inv_on = {"开": "on", "On": "on", "关": "off", "Off": "off"}
+        inv_lv = {"高": "high", "High": "high", "中": "medium", "Medium": "medium",
+                  "低": "low", "Low": "low", "关": "off", "Off": "off"}
+        on_key = inv_on.get(self.sw_var.get(), "on")
+        lv_key = inv_lv.get(self.lv_var.get(), "high")
+        self.frame.config(text=" " + t("rear_name" if self.dev == "rear" else "kbd_name") + " ")
+        self.sw.config(values=[t("on"), t("off")])
+        self.lv.config(values=[t(x) for x in LEVELS])
+        for code, b in self.btns.items():
+            b.config(text=t(code))
+        self.set_state(on_key == "on", lv_key)
 
 
+
+# ---------- UI：设置对话框 ----------
+class SettingsDialog(tk.Toplevel):
+    def __init__(self, app):
+        super().__init__(app)
+        self.app = app
+        self.title(t("settings_title"))
+        self.resizable(False, False)
+        self.configure(bg=theme()["BG"])
+        self.transient(app)
+        self.grab_set()
+
+        s = app.settings
+        th = theme()
+        pad = {"padx": 16, "pady": 8}
+
+        # 语言
+        row = tk.Frame(self, bg=th["BG"])
+        row.pack(fill="x", **pad)
+        tk.Label(row, text=t("language"), bg=th["BG"], fg=th["FG"],
+                 font=("Sans", 10)).pack(side="left")
+        self.lang_var = tk.StringVar(value=s.get("lang", "zh"))
+        cb = ttk.Combobox(row, textvariable=self.lang_var,
+                          values=["zh", "en"], state="readonly", width=8)
+        cb.pack(side="right")
+        cb.bind("<<ComboboxSelected>>", self._on_lang)
+
+        # 主题
+        row = tk.Frame(self, bg=th["BG"])
+        row.pack(fill="x", **pad)
+        tk.Label(row, text=t("theme"), bg=th["BG"], fg=th["FG"],
+                 font=("Sans", 10)).pack(side="left")
+        self.theme_var = tk.StringVar(value=s.get("theme", "dark"))
+        cb = ttk.Combobox(row, textvariable=self.theme_var,
+                          values=["dark", "light"], state="readonly", width=8)
+        cb.pack(side="right")
+        cb.bind("<<ComboboxSelected>>", self._on_theme)
+
+        # 托盘
+        self.tray_var = tk.BooleanVar(value=s.get("tray", True))
+        tk.Checkbutton(self, text=t("tray"), variable=self.tray_var,
+                       bg=th["BG"], fg=th["FG"], selectcolor=th["ENTRY_BG"],
+                       activebackground=th["BG"], font=("Sans", 10),
+                       command=self._on_tray).pack(fill="x", **pad)
+
+        # 自启
+        self.auto_var = tk.BooleanVar(value=autostart_enabled())
+        tk.Checkbutton(self, text=t("autostart"), variable=self.auto_var,
+                       bg=th["BG"], fg=th["FG"], selectcolor=th["ENTRY_BG"],
+                       activebackground=th["BG"], font=("Sans", 10),
+                       command=self._on_autostart).pack(fill="x", **pad)
+
+        # 版本
+        tk.Label(self, text=f"{t('version')} {APP_VERSION}",
+                 bg=th["BG"], fg=th["FG_DIM"], font=("Sans", 9)
+                 ).pack(fill="x", padx=16, pady=(4, 8))
+
+        tk.Button(self, text=t("close"), command=self.destroy,
+                  bg=th["BTN_BG"], fg=th["FG"], relief="flat",
+                  padx=16, pady=4).pack(pady=(0, 12))
+
+    def _on_lang(self, _e=None):
+        self.app.settings["lang"] = self.lang_var.get()
+        save_settings(self.app.settings)
+        set_lang(self.app.settings["lang"])
+        self.app.retranslate()
+
+    def _on_theme(self, _e=None):
+        self.app.settings["theme"] = self.theme_var.get()
+        save_settings(self.app.settings)
+        set_theme(self.app.settings["theme"])
+        self.app.retheme()
+
+    def _on_tray(self):
+        self.app.settings["tray"] = self.tray_var.get()
+        save_settings(self.app.settings)
+        self.app.apply_tray()
+
+    def _on_autostart(self):
+        ok = set_autostart(self.auto_var.get())
+        if not ok:
+            messagebox.showerror(t("settings_title"),
+                                 t("fail", m=AUTOSTART_FILE), parent=self)
+# ---------- UI：主窗口 ----------
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title(f"{APP_NAME} — Z13 灯光控制")
+        self.settings = load_settings()
+        set_lang(self.settings.get("lang", "zh"))
+        set_theme(self.settings.get("theme", "dark"))
+
+        self.title(t("app_title"))
         self.resizable(False, False)
-        self.configure(bg=BG)
-        try:
-            self.attributes("-topmost", True)
-        except tk.TclError:
-            pass
-        self.lift()
-        self.focus_force()
+        th = theme()
+        self.configure(bg=th["BG"])
 
         self.backend = Backend()
         self.state = load_state()
         for d in DEVICES:
             self.state.setdefault(d, {"on": True, "level": "high"})
 
+        self._set_window_icon()
+
         self._busy = False
+        self.cards = {}
         self._build_ui()
         self._restore_ui()
         self._refresh_status()
 
+        # 托盘
+        self.tray = Tray(self)
+        if self.settings.get("tray", True):
+            self.tray.start()
+
+        # 关窗 → 隐藏到托盘（若托盘开），否则退出
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _set_window_icon(self):
+        p = _icon_path(self._overall_state(), 64)
+        if p:
+            try:
+                self._tkimg = tk.PhotoImage(file=p)
+                self.iconphoto(True, self._tkimg)
+            except Exception:
+                pass
+
+    def _overall_state(self):
+        ons = [self.state.get(d, {}).get("on", True) for d in DEVICES]
+        if all(ons):
+            return "on"
+        if not any(ons):
+            return "off"
+        return "partial"
+
     def _build_ui(self):
-        top = tk.Frame(self, bg=BG)
+        th = theme()
+        # 顶栏：标题 + 设置按钮
+        top = tk.Frame(self, bg=th["BG"])
         top.pack(fill="x", padx=14, pady=(10, 4))
-        tk.Label(top, text="后端：Aura HID 直写（按 PID 路由）", fg=FG_OK,
-                 bg=BG, anchor="w", font=("Sans", 9)).pack(fill="x")
-        self.status_lbl = tk.Label(top, text="", fg=FG, bg=BG, anchor="w",
-                                   font=("Sans", 9))
-        self.status_lbl.pack(fill="x", pady=(4, 0))
+        self.title_lbl = tk.Label(top, text=t("app_title"), fg=th["ACCENT"],
+                                  bg=th["BG"], anchor="w",
+                                  font=("Sans", 13, "bold"))
+        self.title_lbl.pack(side="left")
+        self.set_btn = tk.Button(top, text="⚙ " + t("settings"),
+                                 command=self.open_settings,
+                                 bg=th["BTN_BG"], fg=th["FG"], relief="flat",
+                                 padx=8, pady=2)
+        self.set_btn.pack(side="right")
 
-        self.cards = {d: Card(self, d, self._on_change) for d in DEVICES}
+        self.backend_lbl = tk.Label(top, text=t("backend"), fg=th["FG_OK"],
+                                    bg=th["BG"], anchor="w", font=("Sans", 9))
+        self.backend_lbl.pack(fill="x")
 
-        bot = tk.Frame(self, bg=BG)
+        self.status_lbl = tk.Label(top, text="", fg=th["FG"], bg=th["BG"],
+                                   anchor="w", font=("Sans", 9))
+        self.status_lbl.pack(fill="x", pady=(2, 0))
+
+        # 两张卡
+        for d in DEVICES:
+            self.cards[d] = Card(self, d, self._on_change)
+
+        # 底部按钮
+        bot = tk.Frame(self, bg=th["BG"])
         bot.pack(fill="x", padx=14, pady=(4, 8))
-        tk.Button(bot, text="全部打开", command=lambda: self._all(True),
-                  bg=BTN_BG, fg=FG, relief="flat", padx=10, pady=4).pack(side="left")
-        tk.Button(bot, text="全部关闭", command=lambda: self._all(False),
-                  bg=BTN_BG, fg=FG, relief="flat", padx=10, pady=4).pack(side="left", padx=(8, 0))
-        tk.Button(bot, text="刷新状态", command=self._refresh_status,
-                  bg=BTN_BG, fg=FG, relief="flat", padx=10, pady=4).pack(side="right")
+        self.all_on_btn = tk.Button(bot, text=t("all_on"),
+                                    command=lambda: self._all(True),
+                                    bg=th["BTN_BG"], fg=th["FG"],
+                                    relief="flat", padx=10, pady=4)
+        self.all_on_btn.pack(side="left")
+        self.all_off_btn = tk.Button(bot, text=t("all_off"),
+                                     command=lambda: self._all(False),
+                                     bg=th["BTN_BG"], fg=th["FG"],
+                                     relief="flat", padx=10, pady=4)
+        self.all_off_btn.pack(side="left", padx=(8, 0))
+        self.refresh_btn = tk.Button(bot, text=t("refresh"),
+                                     command=self._refresh_status,
+                                     bg=th["BTN_BG"], fg=th["FG"],
+                                     relief="flat", padx=10, pady=4)
+        self.refresh_btn.pack(side="right")
 
-        self.log_lbl = tk.Label(self, text="", fg=FG_INFO, bg=BG, anchor="w",
-                                font=("Sans", 9), padx=14)
+        self.log_lbl = tk.Label(self, text="", fg=th["FG_INFO"], bg=th["BG"],
+                                anchor="w", font=("Sans", 9), padx=14)
         self.log_lbl.pack(fill="x", pady=(0, 10))
 
     def _restore_ui(self):
@@ -384,32 +949,34 @@ class App(tk.Tk):
         nodes = self.backend.refresh()
         parts = [f"{d}={nodes[d]}" for d in DEVICES if d in nodes]
         missing = [d for d in DEVICES if d not in nodes]
-        txt = f"Aura 接口 {len(parts)}/2：" + "  ".join(parts)
+        txt = t("status_fmt", n=len(parts), list="  ".join(parts))
         if missing:
-            txt += f"  (缺: {','.join(missing)})"
+            txt += t("missing", m=",".join(missing))
         self.status_lbl.config(text=txt)
         for d in DEVICES:
             self.cards[d].set_path(nodes.get(d))
+        self._sync_tray_icon()
 
     def _on_change(self, dev, kind, value):
         if kind == "toggle":
             if value:
-                lv = ZH_LEVEL.get(self.cards[dev].lv_var.get(), "high")
-                self._exec(dev, True, lv, f"{DEVICE_ZH[dev]} → {LEVEL_ZH[lv]}")
+                lv = self.cards[dev].lv_var.get()
+                inv = {t(x): x for x in LEVELS}
+                lv = inv.get(lv, "high")
+                self._exec(dev, True, lv)
             else:
-                self._exec(dev, False, "off", f"{DEVICE_ZH[dev]} → 关")
+                self._exec(dev, False, "off")
         elif kind == "level":
-            lv = value
-            if lv == "off":
-                self._exec(dev, False, "off", f"{DEVICE_ZH[dev]} → 关")
+            if value == "off":
+                self._exec(dev, False, "off")
             else:
-                self._exec(dev, True, lv, f"{DEVICE_ZH[dev]} → {LEVEL_ZH[lv]}")
+                self._exec(dev, True, value)
 
-    def _exec(self, dev, on, level, ok_msg):
+    def _exec(self, dev, on, level):
         if self._busy:
             return
         self._busy = True
-        self.log_lbl.config(text="执行中…")
+        self.log_lbl.config(text=t("executing"))
         lvl_num = {"off": 0, "low": 1, "medium": 2, "high": 3}.get(level, 3)
 
         def worker():
@@ -420,19 +987,24 @@ class App(tk.Tk):
                     self.state[dev] = {"on": on, "level": level}
                     save_state(self.state)
                     self.cards[dev].set_state(on, level)
-                    self.log_lbl.config(text=ok_msg)
+                    self.log_lbl.config(
+                        text=f"{self._dev_label(dev)} → {t(level if on else 'off')}")
+                    self._sync_tray_icon()
                 else:
-                    self.log_lbl.config(text=f"失败：{msg}")
+                    self.log_lbl.config(text=t("fail", m=msg))
                     st = self.state[dev]
                     self.cards[dev].set_state(st["on"], st["level"])
             self.after(0, done)
         threading.Thread(target=worker, daemon=True).start()
 
+    def _dev_label(self, dev):
+        return t("rear_name" if dev == "rear" else "kbd_name")
+
     def _all(self, on):
         if self._busy:
             return
         self._busy = True
-        self.log_lbl.config(text="全部打开…" if on else "全部关闭…")
+        self.log_lbl.config(text=t("all_on_msg") if on else t("all_off_msg"))
         lvl = 3 if on else 0
         level_key = "high" if on else "off"
 
@@ -446,17 +1018,97 @@ class App(tk.Tk):
                         self.cards[d].set_state(on, level_key)
                     save_state(self.state)
                     self.log_lbl.config(text=msg)
+                    self._sync_tray_icon()
                 else:
-                    self.log_lbl.config(text=f"失败：{msg}")
+                    self.log_lbl.config(text=t("fail", m=msg))
                     for d in DEVICES:
                         st = self.state[d]
                         self.cards[d].set_state(st["on"], st["level"])
             self.after(0, done)
         threading.Thread(target=worker, daemon=True).start()
 
+    # ---------- 托盘联动 ----------
+    def _sync_tray_icon(self):
+        st = self._overall_state()
+        if getattr(self, "tray", None) and self.tray.ind:
+            self.tray._update_icon(st)
+        self._set_window_icon()
 
+    def toggle_from_tray(self, dev):
+        cur = self.state.get(dev, {}).get("on", True)
+        lvl = self.state.get(dev, {}).get("level", "high")
+        if cur:
+            self._exec(dev, False, "off")
+        else:
+            self._exec(dev, True, lvl if lvl != "off" else "high")
+
+    def apply_tray(self):
+        if self.settings.get("tray", True):
+            self.tray.start()
+        else:
+            self.tray.stop()
+
+    def open_settings(self):
+        SettingsDialog(self)
+
+    def show_window(self):
+        self.deiconify()
+        self.lift()
+        self.attributes("-topmost", True)
+        self.focus_force()
+
+    def _on_close(self):
+        if self.settings.get("tray", True) and self.tray.ind:
+            self.withdraw()
+        else:
+            self.quit()
+
+    def quit(self):
+        try:
+            self.tray.stop()
+        except Exception:
+            pass
+        self.destroy()
+
+    # ---------- 语言/主题即时切换 ----------
+    def retranslate(self):
+        self.title(t("app_title"))
+        self.title_lbl.config(text=t("app_title"))
+        self.set_btn.config(text="⚙ " + t("settings"))
+        self.backend_lbl.config(text=t("backend"))
+        self.all_on_btn.config(text=t("all_on"))
+        self.all_off_btn.config(text=t("all_off"))
+        self.refresh_btn.config(text=t("refresh"))
+        for d in DEVICES:
+            self.cards[d].retranslate()
+        self._refresh_status()
+
+    def retheme(self):
+        th = theme()
+        self.configure(bg=th["BG"])
+        for w in (self.title_lbl, self.backend_lbl, self.status_lbl,
+                  self.log_lbl):
+            w.config(bg=th["BG"])
+        self.title_lbl.config(fg=th["ACCENT"])
+        self.backend_lbl.config(fg=th["FG_OK"])
+        self.status_lbl.config(fg=th["FG"])
+        self.log_lbl.config(fg=th["FG_INFO"])
+        for b in (self.set_btn, self.all_on_btn, self.all_off_btn,
+                  self.refresh_btn):
+            b.config(bg=th["BTN_BG"], fg=th["FG"],
+                     activebackground=th["HL_BG"], activeforeground=th["FG"])
+        # 卡片重建（LabelFrame 配色不好热改）
+        for d in DEVICES:
+            old = self.cards.pop(d)
+            old.frame.destroy()
+        for d in DEVICES:
+            self.cards[d] = Card(self, d, self._on_change)
+            st = self.state[d]
+            self.cards[d].set_state(st.get("on", True), st.get("level", "high"))
+        self._refresh_status()
+# ---------- 自测 ----------
 def selftest():
-    """无 GUI 链路自测：按 PID 找设备 + 关后盖(键盘不动) + 开后盖 + 全开。"""
+    """不开 GUI 验证链路：找设备 → 关后盖(键盘不动) → 开后盖 → 关键盘 → 全开。"""
     b = Backend()
     nodes = b.list_nodes()
     print("节点:", nodes)
@@ -489,14 +1141,27 @@ def selftest():
 def main():
     if "--selftest" in sys.argv:
         raise SystemExit(selftest())
+    if "--version" in sys.argv:
+        print(f"{APP_NAME} {APP_VERSION}")
+        raise SystemExit(0)
+    geo = None
+    open_settings = "--open-settings" in sys.argv
+    for i, a in enumerate(sys.argv):
+        if a == "--geometry" and i + 1 < len(sys.argv):
+            geo = sys.argv[i + 1]
     app = App()
     try:
         app.update_idletasks()
-        w, h = app.winfo_width(), app.winfo_height()
-        sw, sh = app.winfo_screenwidth(), app.winfo_screenheight()
-        app.geometry(f"+{(sw - w) // 2}+{(sh - h) // 3}")
+        if geo:
+            app.geometry(geo)
+        else:
+            w, h = app.winfo_width(), app.winfo_height()
+            sw, sh = app.winfo_screenwidth(), app.winfo_screenheight()
+            app.geometry(f"+{(sw - w) // 2}+{(sh - h) // 3}")
     except tk.TclError:
         pass
+    if open_settings:
+        app.after(600, app.open_settings)
     app.mainloop()
 
 
