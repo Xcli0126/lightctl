@@ -724,6 +724,25 @@ class Card:
 
 
 # ---------- UI：设置对话框 ----------
+def _row(parent, label, var, values, cb, pad):
+    """一行 = 左标签 + 右下拉（C5 工厂）。"""
+    fr = tk.Frame(parent, bg=theme()["BG"])
+    fr.pack(fill="x", **pad)
+    _lbl(fr, label, theme()["BG"], theme()["FG"]).pack(side="left")
+    c = ttk.Combobox(fr, textvariable=var, values=values,
+                     state="readonly", width=8)
+    c.pack(side="right")
+    c.bind("<<ComboboxSelected>>", cb)
+
+
+def _check(parent, text, var, cmd, pad):
+    tk.Checkbutton(parent, text=text, variable=var,
+                   bg=theme()["BG"], fg=theme()["FG"],
+                   selectcolor=theme()["ENTRY_BG"],
+                   activebackground=theme()["BG"], font=("Sans", 10),
+                   command=cmd).pack(fill="x", **pad)
+
+
 class SettingsDialog(tk.Toplevel):
     def __init__(self, app):
         super().__init__(app)
@@ -738,41 +757,19 @@ class SettingsDialog(tk.Toplevel):
         th = theme()
         pad = {"padx": 16, "pady": 8}
 
-        # 语言
-        row = tk.Frame(self, bg=th["BG"])
-        row.pack(fill="x", **pad)
-        tk.Label(row, text=t("language"), bg=th["BG"], fg=th["FG"],
-                 font=("Sans", 10)).pack(side="left")
+        # 语言 / 主题（C5 row 工厂）
         self.lang_var = tk.StringVar(value=s.get("lang", "zh"))
-        cb = ttk.Combobox(row, textvariable=self.lang_var,
-                          values=["zh", "en"], state="readonly", width=8)
-        cb.pack(side="right")
-        cb.bind("<<ComboboxSelected>>", self._on_lang)
-
-        # 主题
-        row = tk.Frame(self, bg=th["BG"])
-        row.pack(fill="x", **pad)
-        tk.Label(row, text=t("theme"), bg=th["BG"], fg=th["FG"],
-                 font=("Sans", 10)).pack(side="left")
+        _row(self, t("language"), self.lang_var, ["zh", "en"],
+             self._on_lang, pad)
         self.theme_var = tk.StringVar(value=s.get("theme", "dark"))
-        cb = ttk.Combobox(row, textvariable=self.theme_var,
-                          values=["dark", "light"], state="readonly", width=8)
-        cb.pack(side="right")
-        cb.bind("<<ComboboxSelected>>", self._on_theme)
+        _row(self, t("theme"), self.theme_var, ["dark", "light"],
+             self._on_theme, pad)
 
-        # 托盘
+        # 托盘 / 自启（C5 check 工厂）
         self.tray_var = tk.BooleanVar(value=s.get("tray", True))
-        tk.Checkbutton(self, text=t("tray"), variable=self.tray_var,
-                       bg=th["BG"], fg=th["FG"], selectcolor=th["ENTRY_BG"],
-                       activebackground=th["BG"], font=("Sans", 10),
-                       command=self._on_tray).pack(fill="x", **pad)
-
-        # 自启
+        _check(self, t("tray"), self.tray_var, self._on_tray, pad)
         self.auto_var = tk.BooleanVar(value=autostart_enabled())
-        tk.Checkbutton(self, text=t("autostart"), variable=self.auto_var,
-                       bg=th["BG"], fg=th["FG"], selectcolor=th["ENTRY_BG"],
-                       activebackground=th["BG"], font=("Sans", 10),
-                       command=self._on_autostart).pack(fill="x", **pad)
+        _check(self, t("autostart"), self.auto_var, self._on_autostart, pad)
 
         # 版本
         tk.Label(self, text=f"{t('version')} {APP_VERSION}",
