@@ -950,69 +950,76 @@ class App(tk.Tk):
             else:
                 self._exec(dev, True, value)
 
-    def _exec(self, dev, on, level):
+    def _run_async(self, call, on_ok, on_fail, rollback):
+        """公共骨架：忙碌检查 → 线程执行 call() → 主线程回调（C8）。
+
+        call: () -> (ok, msg)  在后台线程跑
+        on_ok(msg)/on_fail(msg): 主线程回调
+        rollback: () -> None   忙时或失败时把 UI 回滚到已知状态
+        """
         if self._busy:
-            # 忙时回滚 UI 到已知状态，避免界面与硬件脱节（P6）
-            st = self.state.get(dev, {"on": True, "level": "high"})
-            self.cards[dev].set_state(st.get("on", True), st.get("level", "high"))
+            rollback()
             self.log_lbl.config(text=t("executing"))
             return
         self._busy = True
         self.log_lbl.config(text=t("executing"))
-        lvl_num = {"off": 0, "low": 1, "medium": 2, "high": 3}.get(level, 3)
 
         def worker():
-            ok, msg = self.backend.set_device(dev, on, lvl_num)
+            ok, msg = call()
             def done():
                 self._busy = False
-                if ok:
-                    self.state[dev] = {"on": on, "level": level}
-                    save_state(self.state)
-                    self.cards[dev].set_state(on, level)
-                    self.log_lbl.config(
-                        text=f"{self._dev_label(dev)} → {t(level if on else 'off')}")
-                    self._sync_tray_icon()
-                else:
-                    self.log_lbl.config(text=t("fail", m=msg))
-                    st = self.state[dev]
-                    self.cards[dev].set_state(st["on"], st["level"])
+                (on_ok if ok else on_fail)(msg)
             self.after(0, done)
         threading.Thread(target=worker, daemon=True).start()
+
+    def _exec(self, dev, on, level):
+        lvl_num = {"off": 0, "low": 1, "medium": 2, "high": 3}.get(level, 3)
+
+        def rollback():
+            st = self.state.get(dev, {"on": True, "level": "high"})
+            self.cards[dev].set_state(st.get("on", True), st.get("level", "high"))
+
+        def ok(msg):
+            self.state[dev] = {"on": on, "level": level}
+            save_state(self.state)
+            self.cards[dev].set_state(on, level)
+            self.log_lbl.config(
+                text=f"{_dev_label(dev)} → {t(level if on else 'off')}")
+            self._sync_tray_icon()
+
+        def fail(msg):
+            self.log_lbl.config(text=t("fail", m=msg))
+            rollback()
+
+        self._run_async(lambda: self.backend.set_device(dev, on, lvl_num),
+                        ok, fail, rollback)
 
     def _dev_label(self, dev):
         return _dev_label(dev)
 
     def _all(self, on):
-        if self._busy:
-            for d in DEVICES:
-                st = self.state.get(d, {"on": True, "level": "high"})
-                self.cards[d].set_state(st.get("on", True), st.get("level", "high"))
-            self.log_lbl.config(text=t("executing"))
-            return
-        self._busy = True
-        # 进行中用 executing，不用完成文案（P7）
-        self.log_lbl.config(text=t("executing"))
         lvl = 3 if on else 0
         level_key = "high" if on else "off"
 
-        def worker():
-            ok, msg = self.backend.set_all(on, lvl)
-            def done():
-                self._busy = False
-                if ok:
-                    for d in DEVICES:
-                        self.state[d] = {"on": on, "level": level_key}
-                        self.cards[d].set_state(on, level_key)
-                    save_state(self.state)
-                    self.log_lbl.config(text=msg)
-                    self._sync_tray_icon()
-                else:
-                    self.log_lbl.config(text=t("fail", m=msg))
-                    for d in DEVICES:
-                        st = self.state[d]
-                        self.cards[d].set_state(st["on"], st["level"])
-            self.after(0, done)
-        threading.Thread(target=worker, daemon=True).start()
+        def rollback():
+            for d in DEVICES:
+                st = self.state.get(d, {"on": True, "level": "high"})
+                self.cards[d].set_state(st.get("on", True), st.get("level", "high"))
+
+        def ok(msg):
+            for d in DEVICES:
+                self.state[d] = {"on": on, "level": level_key}
+                self.cards[d].set_state(on, level_key)
+            save_state(self.state)
+            self.log_lbl.config(text=msg)
+            self._sync_tray_icon()
+
+        def fail(msg):
+            self.log_lbl.config(text=t("fail", m=msg))
+            rollback()
+
+        self._run_async(lambda: self.backend.set_all(on, lvl),
+                        ok, fail, rollback)
 
     # ---------- 托盘联动 ----------
     def _sync_tray_icon(self):
