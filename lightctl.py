@@ -40,6 +40,14 @@ AURA_ID = 0x5D
 HIDIOCGRDESCSIZE = 0x80044801
 HIDIOCGRDESC = 0x90044802
 REPORT_SIZE = 64
+# power 字节对：keyb, bar, lid, rear（关=全 0，开=键盘全亮+灯条全状态）
+POWER_OFF = (0x00, 0x00, 0x00, 0x00)
+POWER_ON = (0xFF, 0x1F, 0xFF, 0xFF)
+# Aura 命令字节
+CMD_WAKE, CMD_CFG, CMD_DYN = 0xB9, 0x05, 0xC0
+CMD_POWER, CMD_BRIGHT, CMD_MODE = 0xBD, 0xBA, 0xB3
+CMD_SET, CMD_APPLY = 0xB5, 0xB4
+BRIGHT_HDR = (0xC5, 0xC4)
 
 PID_REAR = "18C6"
 PID_KEYBOARD = "1A30"
@@ -304,51 +312,60 @@ def _pkt(*body):
 
 
 class AuraDevice:
+    """一个 Aura HID 设备（按 PID 打开的单个 hidraw 节点）。"""
+
     def __init__(self, path):
         self.path = path
 
-    def _write_seq(self, packets):
+    def _write_seq(self, packets, delay=0.01):
         fd = os.open(self.path, os.O_RDWR)
         try:
-            for p in packets:
+            for i, p in enumerate(packets):
                 os.write(fd, p)
-                time.sleep(0.01)
+                if i < len(packets) - 1:
+                    time.sleep(delay)
         finally:
             os.close(fd)
+
+    @staticmethod
+    def _init_pkts():
+        # 首字节 0x5d 是 Report ID；"]ASUS Tech.Inc." 的 ] 即 0x5d
+        return [
+            _pkt(CMD_WAKE),
+            b"]ASUS Tech.Inc.",
+            _pkt(CMD_CFG, 0x20, 0x31, 0x00, 0x1A),
+            _pkt(CMD_DYN, 0x03, 0x01),
+        ]
+
+    @staticmethod
+    def _power_pkt(keyb, bar, lid, rear):
+        return _pkt(CMD_POWER, 0x01, keyb, bar, lid, rear, 0xFF)
+
+    @staticmethod
+    def _brightness_pkt(level):
+        return _pkt(CMD_BRIGHT, BRIGHT_HDR[0], BRIGHT_HDR[1], level)
 
     def init(self):
-        self._write_seq([
-            _pkt(0xB9),
-            b"]ASUS Tech.Inc.",
-            _pkt(0x05, 0x20, 0x31, 0x00, 0x1A),
-            _pkt(0xC0, 0x03, 0x01),
-        ])
+        self._write_seq(self._init_pkts())
 
     def set_power(self, keyb, bar, lid, rear):
-        fd = os.open(self.path, os.O_RDWR)
-        try:
-            os.write(fd, _pkt(0xBD, 0x01, keyb, bar, lid, rear, 0xFF))
-        finally:
-            os.close(fd)
+        self._write_seq([self._power_pkt(keyb, bar, lid, rear)])
 
     def set_brightness(self, level):
-        fd = os.open(self.path, os.O_RDWR)
-        try:
-            os.write(fd, _pkt(0xBA, 0xC5, 0xC4, level))
-        finally:
-            os.close(fd)
+        self._write_seq([self._brightness_pkt(level)])
 
     def turn_off(self):
-        self.init()
-        time.sleep(0.05)
-        self.set_power(0x00, 0x00, 0x00, 0x00)
-        self.set_brightness(0)
+        # 一次 fd 序列完成 init+power+brightness（原 3 次 open/close）
+        self._write_seq(
+            self._init_pkts() + [self._power_pkt(*POWER_OFF),
+                                 self._brightness_pkt(0)],
+            delay=0.02)
 
     def turn_on(self, level=3):
-        self.init()
-        time.sleep(0.05)
-        self.set_power(0xFF, 0x1F, 0xFF, 0xFF)
-        self.set_brightness(level)
+        self._write_seq(
+            self._init_pkts() + [self._power_pkt(*POWER_ON),
+                                 self._brightness_pkt(level)],
+            delay=0.02)
 
 
 class Backend:
