@@ -427,8 +427,10 @@ class Backend:
             self.nodes = find_aura_nodes()
         return self.nodes
 
-    def _apply(self, names, on, level):
-        """C9: 取锁→遍历→turn→收集 OSError。返回 (ok, errs)。"""
+    def _apply(self, names, on, level, light=None):
+        """C9: 取锁→遍历→turn→收集 OSError。返回 (ok, errs)。
+        light: dict(mode/color/speed/color2)，仅 on=True 时用。"""
+        light = light or {}
         errs = []
         with self._lock:
             for name in names:
@@ -438,15 +440,21 @@ class Backend:
                 dev = AuraDevice(self.nodes[name])
                 try:
                     if on:
-                        dev.turn_on(level)
+                        dev.turn_on(
+                            level,
+                            zone=DEVICE_ZONE.get(name, 0),
+                            mode=light.get("mode", "static"),
+                            color=light.get("color", (0, 0, 0)),
+                            speed=light.get("speed", "normal"),
+                            color2=light.get("color2", (0, 0, 0)))
                     else:
                         dev.turn_off()
                 except OSError as e:
                     errs.append(f"{_dev_label(name)}: {e}")
         return (not errs), errs
 
-    def set_device(self, name, on, level=3):
-        ok, errs = self._apply([name], on, level)
+    def set_device(self, name, on, level=3, light=None):
+        ok, errs = self._apply([name], on, level, light)
         if not ok:
             # 只有一个错且是"缺设备"→统一文案（原 set_device 语义）
             if len(errs) == 1 and errs[0] == _dev_label(name):
@@ -454,8 +462,8 @@ class Backend:
             return False, "; ".join(errs)
         return True, f"{_dev_label(name)} → {t('state_on' if on else 'state_off')}"
 
-    def set_all(self, on, level=3):
-        ok, errs = self._apply(DEVICES, on, level)
+    def set_all(self, on, level=3, light=None):
+        ok, errs = self._apply(DEVICES, on, level, light)
         if not ok:
             return False, "; ".join(errs)
         return True, t("all_on_msg") if on else t("all_off_msg")
