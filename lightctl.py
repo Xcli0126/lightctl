@@ -549,7 +549,7 @@ class Tray:
             self.mi_rear = _mi(t("rear_zone"), self._on_rear)
             self.mi_kbd = _mi(t("kbd_zone"), self._on_kbd)
             menu.append(Gtk.SeparatorMenuItem())
-            _mi(t("show_win"), self._on_show)
+            self.mi_show = _mi(t("show_win"), self._on_show)
             _mi(t("settings"), self._on_settings)
             menu.append(Gtk.SeparatorMenuItem())
             _mi(t("quit"), self._on_quit)
@@ -590,6 +590,11 @@ class Tray:
                     f"{t('rear_zone')}: {t('state_on' if rear_on else 'state_off')}")
                 self.mi_kbd.set_label(
                     f"{t('kbd_zone')}: {t('state_on' if kbd_on else 'state_off')}")
+                # show/hide 随窗口可见性切换（D3 hide_win）
+                visible = bool(self.app.state is not None) and \
+                    self.app.winfo_viewable()
+                self.mi_show.set_label(
+                    t("hide_win") if visible else t("show_win"))
             except Exception:
                 pass
             return False
@@ -603,7 +608,13 @@ class Tray:
         self.app.after(0, self.app.toggle_from_tray, "keyboard")
 
     def _on_show(self, *_):
-        self.app.after(0, self.app.show_window)
+        # 窗口可见→隐藏，不可见→显示（D3 hide_win）
+        def _toggle():
+            if self.app.winfo_viewable():
+                self.app.withdraw()
+            else:
+                self.app.show_window()
+        self.app.after(0, _toggle)
 
     def _on_settings(self, *_):
         def _open():
