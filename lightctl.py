@@ -95,6 +95,11 @@ _STRINGS = {
         "kbd_name": "键盘灯",
         "switch": "开关",
         "brightness": "亮度",
+        "mode": "模式", "color": "颜色",
+        "mode_static": "常亮", "mode_breathe": "呼吸",
+        "mode_cycle": "循环", "mode_rainbow": "彩虹", "mode_strobe": "频闪",
+        "speed": "速度", "speed_slow": "慢", "speed_normal": "中", "speed_fast": "快",
+        "auto_color": "自动",
         "on": "开", "off": "关",
         "low": "低", "medium": "中", "high": "高",
         "all_on": "全部打开", "all_off": "全部关闭",
@@ -136,6 +141,11 @@ _STRINGS = {
         "kbd_name": "Keyboard backlight",
         "switch": "Switch",
         "brightness": "Brightness",
+        "mode": "Mode", "color": "Color",
+        "mode_static": "Static", "mode_breathe": "Breathe",
+        "mode_cycle": "Cycle", "mode_rainbow": "Rainbow", "mode_strobe": "Strobe",
+        "speed": "Speed", "speed_slow": "Slow", "speed_normal": "Normal", "speed_fast": "Fast",
+        "auto_color": "Auto",
         "on": "On", "off": "Off",
         "low": "Low", "medium": "Medium", "high": "High",
         "all_on": "All on", "all_off": "All off",
@@ -189,7 +199,8 @@ def _i18n_check():
     if zh != en:
         raise AssertionError("i18n mismatch")
     src = open(__file__, encoding="utf-8").read()
-    for m in _re.findall(r'(?<![A-Za-z_.])t\(\s*"([a-z_0-9]+)"', src):
+    # 只扫直接闭合的静态键；动态拼接（前缀 + 变量）跳过
+    for m in _re.findall(r'(?<![A-Za-z_.])t\(\s*"([a-z_0-9]+)"\s*\)', src):
         if m not in zh:
             raise AssertionError("missing i18n key: " + m)
 
@@ -713,6 +724,9 @@ class Card:
         self.dev = dev
         self.on_change = on_change
         self.on_key, self.lv_key = "on", "high"   # key 驱动状态（C10）
+        self.mode_key = "static"
+        self.speed_key = "normal"
+        self.color = (0, 0, 0)   # (0,0,0)=设备自选色
         th = theme()
         self.frame = tk.LabelFrame(
             parent, text=" " + _dev_label(dev) + " ",
@@ -741,6 +755,36 @@ class Card:
         for b in self.btns.values():
             b.pack(side="left", padx=(0, 6))
 
+        # 模式 + 速度（C: color/mode 控制）
+        r4 = tk.Frame(self.frame, bg=th["CARD_BG"]); r4.pack(fill="x", pady=(10, 0))
+        _lbl(r4, t("mode"), th["CARD_BG"], th["FG_DIM"]).pack(side="left")
+        self.mode_var = tk.StringVar(value=t("mode_static"))
+        self.mode_combo = _combo(r4, self.mode_var,
+                                 [t("mode_" + m) for m in MODE_LIST],
+                                 self._mode, width=8)
+        self.mode_combo.pack(side="right")
+        _lbl(r4, t("speed"), th["CARD_BG"], th["FG_DIM"]).pack(side="left", padx=(12, 0))
+        self.speed_var = tk.StringVar(value=t("speed_normal"))
+        self.speed_combo = _combo(r4, self.speed_var,
+                                  [t("speed_" + s) for s in SPEED_LIST],
+                                  self._speed, width=5)
+        self.speed_combo.pack(side="right")
+
+        # 颜色：hex 输入 + 色块预览
+        r5 = tk.Frame(self.frame, bg=th["CARD_BG"]); r5.pack(fill="x", pady=(8, 0))
+        _lbl(r5, t("color"), th["CARD_BG"], th["FG_DIM"]).pack(side="left")
+        self.color_var = tk.StringVar(value="auto")
+        self.color_entry = tk.Entry(r5, textvariable=self.color_var, width=9,
+                                    bg=th["ENTRY_BG"], fg=th["FG"],
+                                    insertbackground=th["FG"],
+                                    font=("Mono", 10))
+        self.color_entry.pack(side="right")
+        self.color_entry.bind("<Return>", self._color)
+        self.color_entry.bind("<FocusOut>", self._color)
+        self.color_sw = tk.Label(r5, text="  ", width=3,
+                                 bg=th["ENTRY_BG"], relief="solid", bd=1)
+        self.color_sw.pack(side="right", padx=(0, 6))
+
         self.path_lbl = _lbl(self.frame, "", th["CARD_BG"], th["FG_DIM"],
                              font=("Mono", 8))
         self.path_lbl.config(anchor="w")
@@ -762,11 +806,65 @@ class Card:
         self.lv_key = LEVELS[idx]
         self.on_change(self.dev, "level", self.lv_key)
 
+    def _mode(self, _e=None):
+        idx = [t("mode_" + m) for m in MODE_LIST].index(self.mode_var.get()) \
+            if self.mode_var.get() in [t("mode_" + m) for m in MODE_LIST] else 0
+        self.mode_key = MODE_LIST[idx]
+        self.on_change(self.dev, "light", None)
+
+    def _speed(self, _e=None):
+        idx = [t("speed_" + s) for s in SPEED_LIST].index(self.speed_var.get()) \
+            if self.speed_var.get() in [t("speed_" + s) for s in SPEED_LIST] else 1
+        self.speed_key = SPEED_LIST[idx]
+        self.on_change(self.dev, "light", None)
+
+    @staticmethod
+    def _parse_color(s):
+        # auto/empty -> (0,0,0); RRGGBB or #RRGGBB -> (r,g,b); invalid -> None
+        s = s.strip().lstrip("#")
+        if not s or s.lower() == "auto":
+            return (0, 0, 0)
+        if len(s) == 6:
+            try:
+                return tuple(int(s[i:i + 2], 16) for i in (0, 2, 4))
+            except ValueError:
+                pass
+        return None   # 非法
+
+    def _color(self, _e=None):
+        rgb = self._parse_color(self.color_var.get())
+        if rgb is None:
+            # 非法输入：回滚到上次值
+            self.color_var.set(self._color_str())
+            return
+        self.color = rgb
+        self._sync_sw()
+        self.on_change(self.dev, "light", None)
+
+    def _color_str(self):
+        if self.color == (0, 0, 0):
+            return "auto"
+        return "%02x%02x%02x" % self.color
+
+    def _sync_sw(self):
+        # update swatch preview
+        if self.color == (0, 0, 0):
+            self.color_sw.config(bg=theme()["ENTRY_BG"])
+        else:
+            self.color_sw.config(bg="#%02x%02x%02x" % self.color)
+
     def set_state(self, on, level):
         self.on_key = "on" if on else "off"
         self.lv_key = level
         self.sw_var.set(t(self.on_key))
         self.lv_var.set(t(level))
+        # 同步模式/速度/颜色控件
+        if hasattr(self, "mode_var"):
+            self.mode_var.set(t("mode_" + self.mode_key))
+            self.speed_var.set(t("speed_" + self.speed_key))
+            if hasattr(self, "color_var"):
+                self.color_var.set(self._color_str())
+                self._sync_sw()
         th = theme()
         self.badge.config(
             text="● " + (t("state_on") if on else t("state_off")),
@@ -782,6 +880,9 @@ class Card:
         self.lv.config(values=[t(x) for x in LEVELS])
         for code, b in self.btns.items():
             b.config(text=t(code))
+        if hasattr(self, "mode_combo"):
+            self.mode_combo.config(values=[t("mode_" + m) for m in MODE_LIST])
+            self.speed_combo.config(values=[t("speed_" + s) for s in SPEED_LIST])
         self.set_state(self.on_key == "on", self.lv_key)
 
     def apply_theme(self):
@@ -1101,6 +1202,12 @@ class App(tk.Tk):
                 self._exec(dev, False, "off")
             else:
                 self._exec(dev, True, value)
+        elif kind == "light":
+            # 模式/颜色/速度改动：仅当灯已开时重下发
+            st = self.state.get(dev, {"on": True})
+            if st.get("on", True):
+                lv = self.cards[dev].lv_key
+                self._exec(dev, True, lv if lv != "off" else "high")
 
     def _run_async(self, call, on_ok, on_fail, rollback):
         """公共骨架：忙碌检查 → 线程执行 call() → 主线程回调（C8）。
@@ -1126,6 +1233,12 @@ class App(tk.Tk):
 
     def _exec(self, dev, on, level):
         lvl_num = {"off": 0, "low": 1, "medium": 2, "high": 3}.get(level, 3)
+        c = self.cards.get(dev)
+        light = None
+        if c is not None and on:
+            light = {"mode": getattr(c, "mode_key", "static"),
+                     "color": getattr(c, "color", (0, 0, 0)),
+                     "speed": getattr(c, "speed_key", "normal")}
 
         def rollback():
             st = self.state.get(dev, {"on": True, "level": "high"})
@@ -1143,7 +1256,7 @@ class App(tk.Tk):
             self.log_lbl.config(text=t("fail", m=msg))
             rollback()
 
-        self._run_async(lambda: self.backend.set_device(dev, on, lvl_num),
+        self._run_async(lambda: self.backend.set_device(dev, on, lvl_num, light),
                         ok, fail, rollback)
 
     def _dev_label(self, dev):
