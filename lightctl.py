@@ -64,14 +64,14 @@ THEMES = {
         "FG": "#cdd6f4", "FG_DIM": "#a6adc8", "FG_OK": "#a6e3a1",
         "FG_ERR": "#f38ba8", "FG_INFO": "#89b4fa",
         "ACCENT": "#89b4fa", "ENTRY_BG": "#45475a",
-        "HL_BG": "#45475a", "SELECT": "#585b70",
+        "HL_BG": "#45475a",
     },
     "light": {
         "BG": "#eff1f5", "CARD_BG": "#e6e9ef", "BTN_BG": "#dce0e8",
         "FG": "#4c4f69", "FG_DIM": "#6c6f85", "FG_OK": "#40a02b",
         "FG_ERR": "#d20f39", "FG_INFO": "#1e66f5",
         "ACCENT": "#1e66f5", "ENTRY_BG": "#ffffff",
-        "HL_BG": "#dce0e8", "SELECT": "#ccd0da",
+        "HL_BG": "#dce0e8",
     },
 }
 
@@ -100,6 +100,7 @@ _STRINGS = {
         "fail": "失败：{m}",
         "settings_title": "设置",
         "language": "界面语言",
+        "lang_zh": "简体中文", "lang_en": "English",
         "tray": "状态栏（托盘）常驻",
         "autostart": "开机自启动",
         "theme": "主题",
@@ -140,6 +141,7 @@ _STRINGS = {
         "fail": "Failed: {m}",
         "settings_title": "Settings",
         "language": "Language",
+        "lang_zh": "简体中文", "lang_en": "English",
         "tray": "Keep in system tray",
         "autostart": "Start on login",
         "theme": "Theme",
@@ -733,23 +735,27 @@ class Card:
 
 
 # ---------- UI：设置对话框 ----------
-def _row(parent, label, var, values, cb, pad):
-    """一行 = 左标签 + 右下拉（C5 工厂）。"""
+def _row(parent, label_key, var, values, cb, pad):
+    """一行 = 左标签 + 右下拉（C5 工厂）。label_key 是 i18n 键，存进 tk 属性供 retranslate 用。"""
     fr = tk.Frame(parent, bg=theme()["BG"])
     fr.pack(fill="x", **pad)
-    _lbl(fr, label, theme()["BG"], theme()["FG"]).pack(side="left")
+    lb = _lbl(fr, t(label_key), theme()["BG"], theme()["FG"])
+    lb.pack(side="left")
+    lb._i18n_key = label_key
     c = ttk.Combobox(fr, textvariable=var, values=values,
                      state="readonly", width=8)
     c.pack(side="right")
     c.bind("<<ComboboxSelected>>", cb)
 
 
-def _check(parent, text, var, cmd, pad):
-    tk.Checkbutton(parent, text=text, variable=var,
-                   bg=theme()["BG"], fg=theme()["FG"],
-                   selectcolor=theme()["ENTRY_BG"],
-                   activebackground=theme()["BG"], font=("Sans", 10),
-                   command=cmd).pack(fill="x", **pad)
+def _check(parent, key, var, cmd, pad):
+    cb = tk.Checkbutton(parent, text=t(key), variable=var,
+                        bg=theme()["BG"], fg=theme()["FG"],
+                        selectcolor=theme()["ENTRY_BG"],
+                        activebackground=theme()["BG"], font=("Sans", 10),
+                        command=cmd)
+    cb._i18n_key = key
+    cb.pack(fill="x", **pad)
 
 
 class SettingsDialog(tk.Toplevel):
@@ -768,42 +774,87 @@ class SettingsDialog(tk.Toplevel):
 
         # 语言 / 主题（C5 row 工厂）
         self.lang_var = tk.StringVar(value=s.get("lang", "zh"))
-        _row(self, t("language"), self.lang_var, ["zh", "en"],
+        _row(self, "language", self.lang_var, ["zh", "en"],
              self._on_lang, pad)
         self.theme_var = tk.StringVar(value=s.get("theme", "dark"))
-        _row(self, t("theme"), self.theme_var, ["dark", "light"],
+        _row(self, "theme", self.theme_var, ["dark", "light"],
              self._on_theme, pad)
 
         # 托盘 / 自启（C5 check 工厂）
         self.tray_var = tk.BooleanVar(value=s.get("tray", True))
-        _check(self, t("tray"), self.tray_var, self._on_tray, pad)
+        _check(self, "tray", self.tray_var, self._on_tray, pad)
         self.auto_var = tk.BooleanVar(value=autostart_enabled())
-        _check(self, t("autostart"), self.auto_var, self._on_autostart, pad)
+        _check(self, "autostart", self.auto_var, self._on_autostart, pad)
 
         # 版本
-        tk.Label(self, text=f"{t('version')} {APP_VERSION}",
-                 bg=th["BG"], fg=th["FG_DIM"], font=("Sans", 9)
-                 ).pack(fill="x", padx=16, pady=(4, 8))
+        ver_lbl = tk.Label(self, text=f"{t('version')} {APP_VERSION}",
+                           bg=th["BG"], fg=th["FG_DIM"], font=("Sans", 9))
+        ver_lbl._i18n_key = "version"
+        ver_lbl.pack(fill="x", padx=16, pady=(4, 8))
 
         self._fb_lbl = tk.Label(self, text="", bg=th["BG"], fg=th["FG_OK"],
                                 font=("Sans", 9), anchor="w")
         self._fb_lbl.pack(fill="x", padx=16)
 
-        tk.Button(self, text=t("close"), command=self.destroy,
-                  bg=th["BTN_BG"], fg=th["FG"], relief="flat",
-                  padx=16, pady=4).pack(pady=(0, 12))
+        close_btn = tk.Button(self, text=t("close"), command=self.destroy,
+                              bg=th["BTN_BG"], fg=th["FG"], relief="flat",
+                              padx=16, pady=4)
+        close_btn._i18n_key = "close"
+        close_btn.pack(pady=(0, 12))
+
+    def retranslate(self):
+        """B5/S4: 对话框跟随语言切换（用 _i18n_key 属性定位控件）。"""
+        self.title(t("settings_title"))
+        for w in self._all_widgets(self):
+            key = getattr(w, "_i18n_key", None)
+            if not key:
+                continue
+            if key == "version":
+                w.config(text=f"{t('version')} {APP_VERSION}")
+            else:
+                w.config(text=t(key))
+
+    def retheme(self):
+        """B5/S4: 对话框跟随主题（bg + 控件配色）。"""
+        th = theme()
+        self.configure(bg=th["BG"])
+        for w in self._all_widgets(self):
+            try:
+                cls = w.winfo_class()
+            except Exception:
+                continue
+            if cls == "Label":
+                w.config(bg=th["BG"], fg=th["FG"])
+            elif cls == "Button":
+                w.config(bg=th["BTN_BG"], fg=th["FG"],
+                         activebackground=th["HL_BG"], activeforeground=th["FG"])
+            elif cls == "Checkbutton":
+                w.config(bg=th["BG"], fg=th["FG"], selectcolor=th["ENTRY_BG"],
+                         activebackground=th["BG"])
+            elif cls == "Frame":
+                w.config(bg=th["BG"])
+
+    @staticmethod
+    def _all_widgets(w):
+        out = []
+        for c in w.winfo_children():
+            out.append(c)
+            out.extend(SettingsDialog._all_widgets(c))
+        return out
 
     def _on_lang(self, _e=None):
         self.app.settings["lang"] = self.lang_var.get()
         save_settings(self.app.settings)
         set_lang(self.app.settings["lang"])
         self.app.retranslate()
+        self.retranslate()
 
     def _on_theme(self, _e=None):
         self.app.settings["theme"] = self.theme_var.get()
         save_settings(self.app.settings)
         set_theme(self.app.settings["theme"])
         self.app.retheme()
+        self.retheme()
 
     def _on_tray(self):
         self.app.settings["tray"] = self.tray_var.get()
