@@ -743,6 +743,36 @@ class Card:
             b.config(text=t(code))
         self.set_state(self.on_key == "on", self.lv_key)
 
+    def apply_theme(self):
+        """C4: 热改卡片配色（LabelFrame 及子控件均可 config），不重建。"""
+        th = theme()
+        self.frame.config(bg=th["CARD_BG"], fg=th["FG"])
+        for w in self._walk(self.frame):
+            cls = w.winfo_class()
+            try:
+                if cls == "Frame":
+                    w.config(bg=th["CARD_BG"])
+                elif cls == "Label":
+                    # 路径/徽章文字色按角色
+                    fg = th["FG_OK"] if w is self.badge else th["FG_DIM"]
+                    w.config(bg=th["CARD_BG"], fg=fg)
+                elif cls == "Button":
+                    w.config(bg=th["BTN_BG"], fg=th["FG"],
+                             activebackground=th["HL_BG"],
+                             activeforeground=th["FG"])
+            except tk.TclError:
+                pass
+        # 徽章色按当前状态
+        self.set_state(self.on_key == "on", self.lv_key)
+
+    @staticmethod
+    def _walk(w):
+        out = []
+        for c in w.winfo_children():
+            out.append(c)
+            out.extend(Card._walk(c))
+        return out
+
 
 
 # ---------- UI：设置对话框 ----------
@@ -1183,17 +1213,9 @@ class App(tk.Tk):
                          activebackground=th["HL_BG"], activeforeground=th["FG"])
             elif role in fg_by_role:
                 w.config(fg=fg_by_role[role])
-        # 卡片重建（LabelFrame 配色不好热改）；用 before=self._bot 保序（P4）
+        # C4: 卡片热改配色，不销毁重建（避免 pack 乱序 + 保留状态）
         for d in DEVICES:
-            old = self.cards.pop(d)
-            old.frame.destroy()
-        for d in DEVICES:
-            c = Card(self, d, self._on_change)
-            c.frame.pack_forget()
-            c.frame.pack(fill="x", padx=14, pady=6, before=self._bot)
-            self.cards[d] = c
-            st = self.state[d]
-            c.set_state(st.get("on", True), st.get("level", "high"))
+            self.cards[d].apply_theme()
         self._refresh_status()
 # ---------- 自测 ----------
 def selftest():
