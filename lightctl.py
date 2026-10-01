@@ -1004,10 +1004,14 @@ class App(tk.Tk):
         nodes = self.backend.refresh()
         parts = [f"{d}={nodes[d]}" for d in DEVICES if d in nodes]
         missing = [d for d in DEVICES if d not in nodes]
-        txt = t("status_fmt", n=len(parts), list="  ".join(parts))
-        if missing:
-            txt += t("missing", m=",".join(missing))
-        self.status_lbl.config(text=txt)
+        if not parts:
+            # 一个 Aura 设备都没找到（D3 no_backend）
+            self.status_lbl.config(text=t("no_backend"))
+        else:
+            txt = t("status_fmt", n=len(parts), list="  ".join(parts))
+            if missing:
+                txt += t("missing", m=",".join(missing))
+            self.status_lbl.config(text=txt)
         for d in DEVICES:
             self.cards[d].set_path(nodes.get(d))
         self._sync_tray_icon()
@@ -1120,6 +1124,13 @@ class App(tk.Tk):
             self.tray.stop()
 
     def open_settings(self):
+        """S6 单例：已有对话框则聚焦，避免 grab_set 冲突。"""
+        for w in self.winfo_children():
+            if isinstance(w, SettingsDialog):
+                w.deiconify()
+                w.lift()
+                w.focus_force()
+                return
         SettingsDialog(self)
 
     def show_window(self):
