@@ -54,8 +54,16 @@ BRIGHT_HDR = (0xC5, 0xC4)
 PID_REAR = "18C6"
 PID_KEYBOARD = "1A30"
 DEVICES = ("rear", "keyboard")
+# 每个设备只认自己 zone 的 SetMode 字节（后盖/灯条=1，键盘=0）
+DEVICE_ZONE = {"rear": 1, "keyboard": 0}
 
 LEVELS = ["off", "low", "medium", "high"]
+
+# Aura 灯效模式（mode 字节值）与速度（speed 字节值）
+MODES = {"static": 0, "breathe": 1, "cycle": 2, "rainbow": 3, "strobe": 10}
+MODE_LIST = list(MODES)
+SPEEDS = {"slow": 0xE1, "normal": 0xEB, "fast": 0xF5}
+SPEED_LIST = list(SPEEDS)
 
 # 主题配色
 THEMES = {
@@ -361,6 +369,23 @@ class AuraDevice:
     def _brightness_pkt(level):
         return _pkt(CMD_BRIGHT, BRIGHT_HDR[0], BRIGHT_HDR[1], level)
 
+    @staticmethod
+    def _mode_pkt(zone, mode, r, g, b, speed, r2=0, g2=0, b2=0):
+        """SetMode：[0x5D,0xB3,zone,mode,r,g,b,speed,dir,rand,r2,g2,b2]。
+        rand：全 0 色→0xFF(设备自选)，breathe→0x01(双色)，否则 0x00。"""
+        if r == 0 and g == 0 and b == 0:
+            rand = 0xFF
+        elif mode == MODES["breathe"]:
+            rand = 0x01
+        else:
+            rand = 0x00
+        return _pkt(CMD_MODE, zone, mode, r, g, b, speed, 0x00, rand,
+                    r2, g2, b2)
+
+    @staticmethod
+    def _commit_pkts():
+        return [_pkt(CMD_SET), _pkt(CMD_APPLY)]
+
     def init(self):
         self._write_seq(self._init_pkts())
 
@@ -377,11 +402,19 @@ class AuraDevice:
                                  self._brightness_pkt(0)],
             delay=0.02)
 
-    def turn_on(self, level=3):
-        self._write_seq(
-            self._init_pkts() + [self._power_pkt(*POWER_ON),
-                                 self._brightness_pkt(level)],
-            delay=0.02)
+    def turn_on(self, level=3, zone=0, mode="static",
+                color=(0, 0, 0), speed="normal",
+                color2=(0, 0, 0)):
+        """开灯 + 设色/模式。color=(0,0,0) 表示设备自选色。
+        zone 决定 SetMode 字节（本设备只认自己的 zone）。"""
+        r, g, b = color
+        r2, g2, b2 = color2
+        pkts = (self._init_pkts()
+                + [self._power_pkt(*POWER_ON), self._brightness_pkt(level)]
+                + [self._mode_pkt(zone, MODES[mode], r, g, b,
+                                  SPEEDS[speed], r2, g2, b2)]
+                + self._commit_pkts())
+        self._write_seq(pkts, delay=0.02)
 
 
 class Backend:
@@ -1222,6 +1255,25 @@ def selftest():
     """不开 GUI 验证链路：找设备 → 关后盖(键盘不动) → 开后盖 → 关键盘 → 全开。"""
     _i18n_check()
     print("OK   i18n keys consistent")
+    # 协议字节校验（_mode_pkt/_commit_pkts/_power_pkt 结构）
+    mp = AuraDevice._mode_pkt(1, MODES["static"], 255, 0, 0,
+                              SPEEDS["normal"])
+    assert mp[0] == AURA_ID and mp[1] == CMD_MODE and mp[2] == 1, \
+        f"mode pkt hdr: {mp[:3].hex()}"
+    assert mp[3] == 0 and mp[4:7] == bytes([255, 0, 0]), f"mode color: {mp[:7].hex()}"
+    assert mp[9] == 0x00, f"static rand: {mp[9]:#x}"
+    # 全 0 色 → rand=0xFF（设备自选）
+    z = AuraDevice._mode_pkt(0, MODES["cycle"], 0, 0, 0, SPEEDS["slow"])
+    assert z[9] == 0xFF, f"cycle rand: {z[9]:#x}"
+    # breathe → rand=0x01
+    br = AuraDevice._mode_pkt(0, MODES["breathe"], 0, 255, 255,
+                              SPEEDS["fast"], 0, 0, 255)
+    assert br[9] == 0x01, f"breathe rand: {br[9]:#x}"
+    cks = AuraDevice._commit_pkts()
+    assert len(cks) == 2 and cks[0][1] == CMD_SET and cks[1][1] == CMD_APPLY
+    pp = AuraDevice._power_pkt(*POWER_ON)
+    assert pp[1] == CMD_POWER and pp[3:7] == bytes(POWER_ON)
+    print("OK   protocol bytes (mode/commit/power)")
     b = Backend()
     nodes = b.list_nodes()
     print("节点:", nodes)
