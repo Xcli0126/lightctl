@@ -394,24 +394,11 @@ class Backend:
             self.nodes = find_aura_nodes()
         return self.nodes
 
-    def set_device(self, name, on, level=3):
-        with self._lock:
-            if name not in self.nodes:
-                return False, t("err_no_dev")
-            dev = AuraDevice(self.nodes[name])
-            try:
-                if on:
-                    dev.turn_on(level)
-                else:
-                    dev.turn_off()
-                return True, f"{_dev_label(name)} → {t('state_on' if on else 'state_off')}"
-            except OSError as e:
-                return False, str(e)
-
-    def set_all(self, on, level=3):
+    def _apply(self, names, on, level):
+        """C9: 取锁→遍历→turn→收集 OSError。返回 (ok, errs)。"""
         errs = []
         with self._lock:
-            for name in DEVICES:
+            for name in names:
                 if name not in self.nodes:
                     errs.append(_dev_label(name))
                     continue
@@ -423,7 +410,20 @@ class Backend:
                         dev.turn_off()
                 except OSError as e:
                     errs.append(f"{_dev_label(name)}: {e}")
-        if errs:
+        return (not errs), errs
+
+    def set_device(self, name, on, level=3):
+        ok, errs = self._apply([name], on, level)
+        if not ok:
+            # 只有一个错且是"缺设备"→统一文案（原 set_device 语义）
+            if len(errs) == 1 and errs[0] == _dev_label(name):
+                return False, t("err_no_dev")
+            return False, "; ".join(errs)
+        return True, f"{_dev_label(name)} → {t('state_on' if on else 'state_off')}"
+
+    def set_all(self, on, level=3):
+        ok, errs = self._apply(DEVICES, on, level)
+        if not ok:
             return False, "; ".join(errs)
         return True, t("all_on_msg") if on else t("all_off_msg")
 
