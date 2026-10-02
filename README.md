@@ -60,13 +60,18 @@ id -nG | grep -qw users || sudo usermod -aG users $USER
 
 # 4. 跑
 python3 lightctl.py
+
+# 5.（可选）装桌面入口 / 应用菜单
+install -Dm755 lightctl.py ~/.local/bin/lightctl
+sed "s|^Exec=.*|Exec=$HOME/.local/bin/lightctl|" lightctl.desktop \
+    > ~/.local/share/applications/lightctl.desktop
 ```
 
 ## 使用
 
 - **开关**下拉：开 / 关单路灯
 - **亮度**下拉 + **关/低/中/高**快捷按钮：两路各 4 档（后盖灯是独立 mode/color 设备，亮度档对其效果可能有限）
-- **全部打开 / 全部关闭**：两路一起
+- **全部打开 / 全部关闭**：两路一起（带上各自卡片当前选的模式/速度/颜色；一台成功一台失败时只回滚失败的那台，日志提示"部分完成"）
 - **刷新状态**：重新扫描 hidraw 设备（磁吸键盘重插后用）
 - **⚙ 设置**：切换语言、主题、托盘常驻、开机自启
 - 托盘图标：左键点菜单开关两路灯 / 显示主窗口 / 打开设置 / 退出；主窗口关闭时最小化到托盘
@@ -92,7 +97,8 @@ OK   全开: 全部已打开
 
 ## 状态持久化
 
-开关状态存 `~/.config/lightctl/state.json`，重启 GUI 自动恢复上次的开关/亮度显示。
+开关状态存 `~/.config/lightctl/state.json`（带 `schema` 版本号，加载时自动丢弃旧版遗留键并校验取值），
+重启 GUI 自动恢复上次的开关/亮度显示。配置文件用「临时文件 + rename」原子写入，断电或被杀不会留半截 JSON。
 
 ## 系统要求
 

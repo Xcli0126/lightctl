@@ -18,6 +18,7 @@ lightctl — ROG Flow Z13 (GZ302EA) 灯光控制 GUI
 """
 import ctypes
 import ctypes.util
+import errno as _errno
 import glob
 import argparse
 import io
@@ -28,6 +29,10 @@ import threading
 import time
 import tkinter as tk
 from tkinter import ttk, messagebox
+
+STATE_SCHEMA = 2
+errno_EACCES = _errno.EACCES
+errno_EPERM = _errno.EPERM
 
 APP_NAME = "lightctl"
 APP_VERSION = "1.1.0"
@@ -90,7 +95,6 @@ _STRINGS = {
     "zh": {
         "app_title": "lightctl — Z13 灯光控制",
         "backend": "后端：Aura HID 直写（按 PID 路由）",
-        "no_backend": "未找到可用的 Aura 设备",
         "rear_name": "背光（后部灯条）",
         "kbd_name": "键盘灯",
         "switch": "开关",
@@ -111,6 +115,9 @@ _STRINGS = {
         "executing": "执行中…",
         "all_on_msg": "全部已打开", "all_off_msg": "全部已关闭",
         "fail": "失败：{m}",
+        "partial_msg": "部分完成：{m}",
+        "err_perm": "权限不足：{p}（需要 udev 规则）",
+        "color_bad": "颜色格式应为 RRGGBB 或 auto",
         "settings_title": "设置",
         "language": "界面语言",
         "lang_zh": "简体中文", "lang_en": "English",
@@ -136,7 +143,6 @@ _STRINGS = {
     "en": {
         "app_title": "lightctl — Z13 Lighting Control",
         "backend": "Backend: Aura HID direct write (per-PID routing)",
-        "no_backend": "No Aura device found",
         "rear_name": "Rear glow (light bar)",
         "kbd_name": "Keyboard backlight",
         "switch": "Switch",
@@ -157,6 +163,9 @@ _STRINGS = {
         "executing": "Working…",
         "all_on_msg": "All lights on", "all_off_msg": "All lights off",
         "fail": "Failed: {m}",
+        "partial_msg": "Partially done: {m}",
+        "err_perm": "Permission denied: {p} (udev rule required)",
+        "color_bad": "Color must be RRGGBB or auto",
         "settings_title": "Settings",
         "language": "Language",
         "lang_zh": "简体中文", "lang_en": "English",
@@ -193,7 +202,7 @@ def t(key, **kw):
 
 
 def _i18n_check():
-    """S5: zh/en key sets match, and every t() literal exists."""
+    """zh/en key sets match, and every t() literal exists."""
     import re as _re
     zh, en = set(_STRINGS["zh"]), set(_STRINGS["en"])
     if zh != en:
@@ -235,10 +244,16 @@ def _read_json(path, default):
 
 
 def _write_json(path, data):
+    """原子写（临时文件 + os.replace）：断电/被杀不会留半截 JSON。"""
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
+        tmp = path + ".tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
         return True
     except Exception as e:
         sys.stderr.write(f"lightctl: write {path}: {e}\n")
@@ -254,7 +269,21 @@ def save_settings(s):
 
 
 def load_state():
-    return _read_json(STATE_FILE, {})
+    """读状态并清洗：带 schema 版本、丢弃旧版遗留键（如 lightbar）、
+    把每个设备项校验成 {on: bool, level: str}，坏值回落默认。"""
+    raw = _read_json(STATE_FILE, {})
+    out = {"schema": STATE_SCHEMA}
+    for d in DEVICES:
+        v = raw.get(d)
+        if not isinstance(v, dict):
+            v = {}
+        on = v.get("on")
+        level = v.get("level")
+        out[d] = {
+            "on": on if isinstance(on, bool) else True,
+            "level": level if level in LEVELS else "high",
+        }
+    return out
 
 
 def save_state(s):
@@ -266,9 +295,11 @@ def set_autostart(enabled):
         if enabled:
             os.makedirs(os.path.dirname(AUTOSTART_FILE), exist_ok=True)
             exe = os.path.abspath(sys.argv[0])
+            # 路径带空格/特殊字符也要能解析；用当前解释器而非裸 python3
+            q = lambda s: '"' + s.replace('"', '\\\\"') + '"'
             content = (
                 "[Desktop Entry]\nType=Application\nName=lightctl\n"
-                f"Exec=python3 {exe}\nTerminal=false\n"
+                f"Exec={q(sys.executable)} {q(exe)}\nTerminal=false\n"
                 "X-GNOME-Autostart-enabled=true\nStartupNotify=true\n"
             )
             with open(AUTOSTART_FILE, "w", encoding="utf-8") as f:
@@ -282,7 +313,16 @@ def set_autostart(enabled):
 
 
 def autostart_enabled():
-    return os.path.exists(AUTOSTART_FILE)
+    if not os.path.exists(AUTOSTART_FILE):
+        return False
+    # 旧版自启动文件 Exec 没引号/写死 python3，检测到就按当前格式重写
+    try:
+        with open(AUTOSTART_FILE, encoding="utf-8") as f:
+            if "Exec=\"" not in f.read():
+                set_autostart(True)
+    except OSError:
+        pass
+    return True
 
 
 # ---------- 协议层 ----------
@@ -307,7 +347,10 @@ def _has_aura(fd):
 
 
 def find_aura_nodes():
+    """返回 (nodes, denied)：nodes 是 name->path；
+    denied 是 name->(path, errno)，记录因权限打不开的节点。"""
     out = {}
+    denied = {}
     for ue in sorted(glob.glob("/sys/class/hidraw/hidraw*/device/uevent")):
         try:
             with open(ue) as f:
@@ -327,7 +370,10 @@ def find_aura_nodes():
         path = "/dev/" + dev
         try:
             fd = os.open(path, os.O_RDWR)
-        except OSError:
+        except OSError as e:
+            # 打不开也记下原因：权限不足 ≠ 设备不存在
+            name = "rear" if prod == PID_REAR else "keyboard"
+            denied.setdefault(name, (path, e.errno))
             continue
         try:
             if _has_aura(fd):
@@ -335,7 +381,7 @@ def find_aura_nodes():
                 out[name] = path
         finally:
             os.close(fd)
-    return out
+    return out, denied
 
 
 def _pkt(*body):
@@ -397,15 +443,6 @@ class AuraDevice:
     def _commit_pkts():
         return [_pkt(CMD_SET), _pkt(CMD_APPLY)]
 
-    def init(self):
-        self._write_seq(self._init_pkts())
-
-    def set_power(self, keyb, bar, lid, rear):
-        self._write_seq([self._power_pkt(keyb, bar, lid, rear)])
-
-    def set_brightness(self, level):
-        self._write_seq([self._brightness_pkt(level)])
-
     def turn_off(self):
         # 一次 fd 序列完成 init+power+brightness（原 3 次 open/close）
         self._write_seq(
@@ -431,53 +468,81 @@ class AuraDevice:
 class Backend:
     def __init__(self):
         self._lock = threading.Lock()
-        self.nodes = find_aura_nodes()
+        self.nodes, self.denied = find_aura_nodes()
 
     def refresh(self):
         with self._lock:
-            self.nodes = find_aura_nodes()
+            self.nodes, self.denied = find_aura_nodes()
         return self.nodes
 
+    @staticmethod
+    def no_dev_msg():
+        """一个节点都没有时，区分"权限不足"与"设备不存在"。"""
+        nodes, denied = find_aura_nodes()
+        if nodes:
+            return t("err_no_dev")
+        for name, (path, errno) in denied.items():
+            if errno in (errno_EACCES, errno_EPERM):
+                return t("err_perm", p=path)
+        return t("err_no_dev")
+
     def _apply(self, names, on, level, light=None):
-        """C9: 取锁→遍历→turn→收集 OSError。返回 (ok, errs)。
-        light: dict(mode/color/speed/color2)，仅 on=True 时用。"""
+        """取锁→遍历→turn→收集结果。
+        light: dict(name -> {mode/color/speed/color2})，逐设备取自己的灯效，仅 on=True 时用。
+        返回 (ok_names, errs)；errs 元素为 (name, reason)：
+        reason == "missing" 表示设备不在（文案在调用方拼），其余是 OSError 文本。
+        """
         light = light or {}
-        errs = []
+        errs, ok_names = [], []
         with self._lock:
             for name in names:
                 if name not in self.nodes:
-                    errs.append(_dev_label(name))
+                    errs.append((name, "missing"))
                     continue
                 dev = AuraDevice(self.nodes[name])
+                cfg = light.get(name) or {}
                 try:
                     if on:
                         dev.turn_on(
                             level,
                             zone=DEVICE_ZONE.get(name, 0),
-                            mode=light.get("mode", "static"),
-                            color=light.get("color", (0, 0, 0)),
-                            speed=light.get("speed", "normal"),
-                            color2=light.get("color2", (0, 0, 0)))
+                            mode=cfg.get("mode", "static"),
+                            color=cfg.get("color", (0, 0, 0)),
+                            speed=cfg.get("speed", "normal"),
+                            color2=cfg.get("color2", (0, 0, 0)))
                     else:
                         dev.turn_off()
+                    ok_names.append(name)
                 except OSError as e:
-                    errs.append(f"{_dev_label(name)}: {e}")
-        return (not errs), errs
+                    errs.append((name, str(e)))
+        return ok_names, errs
+
+    @staticmethod
+    def _err_text(errs):
+        """(name, reason) 列表 → 显示文案；missing 设备用"未找到"统一说法。"""
+        return "; ".join(
+            t("err_no_dev") if r == "missing" else f"{_dev_label(n)}: {r}"
+            for n, r in errs)
 
     def set_device(self, name, on, level=3, light=None):
-        ok, errs = self._apply([name], on, level, light)
-        if not ok:
-            # 只有一个错且是"缺设备"→统一文案（原 set_device 语义）
-            if len(errs) == 1 and errs[0] == _dev_label(name):
-                return False, t("err_no_dev")
-            return False, "; ".join(errs)
+        ok_names, errs = self._apply([name], on, level, light)
+        if not ok_names:
+            if all(r == "missing" for _, r in errs):
+                return False, self.no_dev_msg()
+            return False, self._err_text(errs)
         return True, f"{_dev_label(name)} → {t('state_on' if on else 'state_off')}"
 
     def set_all(self, on, level=3, light=None):
-        ok, errs = self._apply(DEVICES, on, level, light)
-        if not ok:
-            return False, "; ".join(errs)
-        return True, t("all_on_msg") if on else t("all_off_msg")
+        ok_names, errs = self._apply(DEVICES, on, level, light)
+        if not errs:
+            return True, t("all_on_msg") if on else t("all_off_msg")
+        if not ok_names:
+            if all(r == "missing" for _, r in errs):
+                return False, self.no_dev_msg()
+            return False, self._err_text(errs)
+        # 部分成功：成功名单一等结果，调用方据此只回滚失败的设备
+        return (ok_names, errs), (t("partial_msg", m=self._err_text(errs))
+                                  if on else t("all_off_msg"))
 
     def list_nodes(self):
         with self._lock:
@@ -531,7 +596,7 @@ _ICON_CACHE = {}
 
 
 def _icon_path(state="on", size=64):
-    """图标 PNG 路径；命中缓存/磁盘则直接返回（P11，C1 合并 get_icon）。"""
+    """图标 PNG 路径；磁盘有就用磁盘，否则内存缓存生成并落盘。"""
     key = (state, size)
     path = os.path.join(CONFIG_DIR, f"icon_{state}_{size}.png")
     if os.path.exists(path) and os.path.getsize(path) > 0:
@@ -573,10 +638,12 @@ class Tray:
         self._state = "on"
         self._Gtk = None
         self._GLib = None
+        self._running = False   # start/stop 重入判据（stop 先清 ind，不能拿 ind 判）
 
     def start(self):
-        if not self._available or self.ind is not None:
+        if not self._available or self._running:
             return
+        self._running = True
         import gi
         gi.require_version("Gtk", "3.0")
         gi.require_version("AyatanaAppIndicator3", "0.1")
@@ -589,7 +656,7 @@ class Tray:
                 "lightctl", "preferences-desktop-display",
                 AppInd.IndicatorCategory.HARDWARE)
             ind.set_status(AppInd.IndicatorStatus.ACTIVE)
-            ind.set_title(t("tray_tip") if False else APP_NAME)
+            ind.set_title(APP_NAME)
             menu = Gtk.Menu()
 
             def _mi(label, cb):
@@ -624,15 +691,23 @@ class Tray:
         if not self.ind:
             return
         path = _icon_path(state, 48)
+        # 先在主线程刷新标签（内部读 winfo_viewable），再投递图标更新
+        self._refresh_labels()
         def _do():
             if path:
                 self.ind.set_icon_full(path, APP_NAME)
-            self._refresh_labels()
             return False
         self._call(_do)
 
     def _refresh_labels(self):
-        # 用菜单项标签反映当前状态
+        # 用菜单项标签反映当前状态。
+        # Tk 只能在主线程碰：winfo_viewable 在这里（调用方是主线程）读好缓存，
+        # GTK 闭包里只用普通 Python 属性。
+        try:
+            visible = bool(self.app.state is not None) and \
+                self.app.winfo_viewable()
+        except tk.TclError:
+            visible = False
         st = self.app.state
         def _do():
             try:
@@ -642,9 +717,7 @@ class Tray:
                     f"{t('rear_zone')}: {t('state_on' if rear_on else 'state_off')}")
                 self.mi_kbd.set_label(
                     f"{t('kbd_zone')}: {t('state_on' if kbd_on else 'state_off')}")
-                # show/hide 随窗口可见性切换（D3 hide_win）
-                visible = bool(self.app.state is not None) and \
-                    self.app.winfo_viewable()
+                # show/hide 随窗口可见性切换（用主线程缓存的 visible）
                 self.mi_show.set_label(
                     t("hide_win") if visible else t("show_win"))
             except Exception:
@@ -660,12 +733,13 @@ class Tray:
         self.app.after(0, self.app.toggle_from_tray, "keyboard")
 
     def _on_show(self, *_):
-        # 窗口可见→隐藏，不可见→显示（D3 hide_win）
+        # 窗口可见→隐藏，不可见→显示
         def _toggle():
             if self.app.winfo_viewable():
                 self.app.withdraw()
             else:
                 self.app.show_window()
+            self._refresh_labels()   # 可见性变了，更新菜单文案（主线程）
         self.app.after(0, _toggle)
 
     def _on_settings(self, *_):
@@ -678,8 +752,9 @@ class Tray:
         self.app.after(0, self.app.shutdown)
 
     def stop(self):
-        if self.ind is None:
+        if not self._running:
             return
+        self._running = False   # 先挡 start 重入，再异步关 indicator
         ind, self.ind = self.ind, None
         Gtk, GLib = getattr(self, "_Gtk", None), getattr(self, "_GLib", None)
         if GLib is None or Gtk is None:
@@ -723,7 +798,7 @@ class Card:
     def __init__(self, parent, dev, on_change):
         self.dev = dev
         self.on_change = on_change
-        self.on_key, self.lv_key = "on", "high"   # key 驱动状态（C10）
+        self.on_key, self.lv_key = "on", "high"   # 卡片只存 key，显示时再翻译
         self.mode_key = "static"
         self.speed_key = "normal"
         self.color = (0, 0, 0)   # (0,0,0)=设备自选色
@@ -834,8 +909,10 @@ class Card:
     def _color(self, _e=None):
         rgb = self._parse_color(self.color_var.get())
         if rgb is None:
-            # 非法输入：回滚到上次值
+            # 非法输入：回滚到上次值并提示（on_change 是 App 方法，日志行可用）
             self.color_var.set(self._color_str())
+            if hasattr(self.on_change, "__self__"):
+                self.on_change.__self__.log_lbl.config(text=t("color_bad"))
             return
         self.color = rgb
         self._sync_sw()
@@ -847,7 +924,7 @@ class Card:
         return "%02x%02x%02x" % self.color
 
     def _sync_sw(self):
-        # update swatch preview
+        # update swatch preview（auto = 设备自选色，色块显示中性底）
         if self.color == (0, 0, 0):
             self.color_sw.config(bg=theme()["ENTRY_BG"])
         else:
@@ -886,7 +963,7 @@ class Card:
         self.set_state(self.on_key == "on", self.lv_key)
 
     def apply_theme(self):
-        """C4: 热改卡片配色（LabelFrame 及子控件均可 config），不重建。"""
+        """热改卡片配色（LabelFrame 及子控件均可 config），不重建。"""
         th = theme()
         self.frame.config(bg=th["CARD_BG"], fg=th["FG"])
         for w in self._walk(self.frame):
@@ -902,6 +979,9 @@ class Card:
                     w.config(bg=th["BTN_BG"], fg=th["FG"],
                              activebackground=th["HL_BG"],
                              activeforeground=th["FG"])
+                elif cls == "Entry":
+                    w.config(bg=th["ENTRY_BG"], fg=th["FG"],
+                             insertbackground=th["FG"])
             except tk.TclError:
                 pass
         # 徽章色按当前状态
@@ -919,7 +999,7 @@ class Card:
 
 # ---------- UI：设置对话框 ----------
 def _row(parent, label_key, var, values, cb, pad):
-    """一行 = 左标签 + 右下拉（C5 工厂）。label_key 是 i18n 键，存进 tk 属性供 retranslate 用。"""
+    """一行 = 左标签 + 右下拉。label_key 是 i18n 键，存进 tk 属性供 retranslate 用。"""
     fr = tk.Frame(parent, bg=theme()["BG"])
     fr.pack(fill="x", **pad)
     lb = _lbl(fr, t(label_key), theme()["BG"], theme()["FG"])
@@ -955,15 +1035,21 @@ class SettingsDialog(tk.Toplevel):
         th = theme()
         pad = {"padx": 16, "pady": 8}
 
-        # 语言 / 主题（C5 row 工厂）
-        self.lang_var = tk.StringVar(value=s.get("lang", "zh"))
-        _row(self, "language", self.lang_var, ["zh", "en"],
+        # 语言 / 主题：下拉显示翻译文本，内部反查回代码值
+        self.lang_codes = ["zh", "en"]
+        self.theme_codes = ["dark", "light"]
+        self.lang_var = tk.StringVar(
+            value=t("lang_" + s.get("lang", "zh")))
+        _row(self, "language", self.lang_var,
+             [t("lang_" + c) for c in self.lang_codes],
              self._on_lang, pad)
-        self.theme_var = tk.StringVar(value=s.get("theme", "dark"))
-        _row(self, "theme", self.theme_var, ["dark", "light"],
+        self.theme_var = tk.StringVar(
+            value=t("theme_" + s.get("theme", "dark")))
+        _row(self, "theme", self.theme_var,
+             [t("theme_" + c) for c in self.theme_codes],
              self._on_theme, pad)
 
-        # 托盘 / 自启（C5 check 工厂）
+        # 托盘 / 自启
         self.tray_var = tk.BooleanVar(value=s.get("tray", True))
         _check(self, "tray", self.tray_var, self._on_tray, pad)
         self.auto_var = tk.BooleanVar(value=autostart_enabled())
@@ -986,8 +1072,12 @@ class SettingsDialog(tk.Toplevel):
         close_btn.pack(pady=(0, 12))
 
     def retranslate(self):
-        """B5/S4: 对话框跟随语言切换（用 _i18n_key 属性定位控件）。"""
+        """对话框跟随语言切换（用 _i18n_key 属性定位控件）。"""
         self.title(t("settings_title"))
+        # 下拉显示值跟随语言（代码值存在 settings 里）
+        self.lang_var.set(t("lang_" + self.app.settings.get("lang", "zh")))
+        self.theme_var.set(
+            t("theme_" + self.app.settings.get("theme", "dark")))
         for w in self._all_widgets(self):
             key = getattr(w, "_i18n_key", None)
             if not key:
@@ -998,7 +1088,7 @@ class SettingsDialog(tk.Toplevel):
                 w.config(text=t(key))
 
     def retheme(self):
-        """B5/S4: 对话框跟随主题（bg + 控件配色）。"""
+        """对话框跟随主题（bg + 控件配色）。"""
         th = theme()
         self.configure(bg=th["BG"])
         for w in self._all_widgets(self):
@@ -1008,6 +1098,9 @@ class SettingsDialog(tk.Toplevel):
                 continue
             if cls == "Label":
                 w.config(bg=th["BG"], fg=th["FG"])
+            elif cls == "Entry":
+                w.config(bg=th["ENTRY_BG"], fg=th["FG"],
+                         insertbackground=th["FG"])
             elif cls == "Button":
                 w.config(bg=th["BTN_BG"], fg=th["FG"],
                          activebackground=th["HL_BG"], activeforeground=th["FG"])
@@ -1025,15 +1118,24 @@ class SettingsDialog(tk.Toplevel):
             out.extend(SettingsDialog._all_widgets(c))
         return out
 
+    @staticmethod
+    def _code_of(labels, codes, shown, default):
+        """显示文本 → 代码值（找不到就回落 default）。"""
+        return codes[labels.index(shown)] if shown in labels else default
+
     def _on_lang(self, _e=None):
-        self.app.settings["lang"] = self.lang_var.get()
+        self.app.settings["lang"] = self._code_of(
+            [t("lang_" + c) for c in self.lang_codes],
+            self.lang_codes, self.lang_var.get(), "zh")
         save_settings(self.app.settings)
         set_lang(self.app.settings["lang"])
         self.app.retranslate()
         self.retranslate()
 
     def _on_theme(self, _e=None):
-        self.app.settings["theme"] = self.theme_var.get()
+        self.app.settings["theme"] = self._code_of(
+            [t("theme_" + c) for c in self.theme_codes],
+            self.theme_codes, self.theme_var.get(), "dark")
         save_settings(self.app.settings)
         set_theme(self.app.settings["theme"])
         self.app.retheme()
@@ -1080,7 +1182,7 @@ class App(tk.Tk):
 
         self._busy = False
         self.cards = {}
-        self._themed = []   # (widget, role) 注册表，retheme 遍历（C7）
+        self._themed = []   # (widget, role) 注册表，retheme 遍历
         self._build_ui()
         self._restore_ui()
         self._refresh_status()
@@ -1103,7 +1205,8 @@ class App(tk.Tk):
                 pass
 
     def _overall_state(self):
-        ons = [self.state.get(d, {}).get("on", True) for d in DEVICES]
+        ons = [
+            (self.state.get(d) or {}).get("on", True) for d in DEVICES]
         if all(ons):
             return "on"
         if not any(ons):
@@ -1111,7 +1214,7 @@ class App(tk.Tk):
         return "partial"
 
     def _reg(self, widget, role):
-        """登记控件主题角色，retheme 统一刷新（C7）。"""
+        """登记控件主题角色，retheme 统一刷新。"""
         self._themed.append((widget, role))
         return widget
 
@@ -1147,7 +1250,7 @@ class App(tk.Tk):
         for d in DEVICES:
             self.cards[d] = Card(self, d, self._on_change)
 
-        # 底部按钮（C6 工厂）
+        # 底部按钮
         self._bot = tk.Frame(self, bg=th["BG"])
         self._bot.pack(fill="x", padx=14, pady=(4, 8))
         bot = self._bot
@@ -1177,8 +1280,8 @@ class App(tk.Tk):
         parts = [f"{d}={nodes[d]}" for d in DEVICES if d in nodes]
         missing = [d for d in DEVICES if d not in nodes]
         if not parts:
-            # 一个 Aura 设备都没找到（D3 no_backend）
-            self.status_lbl.config(text=t("no_backend"))
+            # 一个 Aura 设备都没找到：权限不足和设备不存在要分清
+            self.status_lbl.config(text=Backend.no_dev_msg())
         else:
             txt = t("status_fmt", n=len(parts), list="  ".join(parts))
             if missing:
@@ -1210,7 +1313,7 @@ class App(tk.Tk):
                 self._exec(dev, True, lv if lv != "off" else "high")
 
     def _run_async(self, call, on_ok, on_fail, rollback):
-        """公共骨架：忙碌检查 → 线程执行 call() → 主线程回调（C8）。
+        """公共骨架：忙碌检查 → 线程执行 call() → 主线程回调。
 
         call: () -> (ok, msg)  在后台线程跑
         on_ok(msg)/on_fail(msg): 主线程回调
@@ -1224,11 +1327,17 @@ class App(tk.Tk):
         self.log_lbl.config(text=t("executing"))
 
         def worker():
-            ok, msg = call()
+            try:
+                ok, msg = call()
+            except Exception as e:   # 兜底：任何异常都必须复位 _busy
+                ok, msg = False, f"{type(e).__name__}: {e}"
             def done():
                 self._busy = False
                 (on_ok if ok else on_fail)(msg)
-            self.after(0, done)
+            try:
+                self.after(0, done)
+            except tk.TclError:
+                pass   # 窗口已销毁，忽略
         threading.Thread(target=worker, daemon=True).start()
 
     def _exec(self, dev, on, level):
@@ -1265,9 +1374,15 @@ class App(tk.Tk):
     def _all(self, on):
         lvl = 3 if on else 0
         level_key = "high" if on else "off"
+        # 逐设备带上各自卡片的灯效，避免批量操作把灯效重置成默认
+        lights = {d: {"mode": getattr(self.cards[d], "mode_key", "static"),
+                      "color": getattr(self.cards[d], "color", (0, 0, 0)),
+                      "speed": getattr(self.cards[d], "speed_key", "normal")}
+                  for d in DEVICES}
 
-        def rollback():
-            for d in DEVICES:
+        def rollback(names=None):
+            # 部分失败只回滚失败的设备，成功的保持新状态
+            for d in (DEVICES if names is None else names):
                 st = self.state.get(d, {"on": True, "level": "high"})
                 self.cards[d].set_state(st.get("on", True), st.get("level", "high"))
 
@@ -1280,11 +1395,24 @@ class App(tk.Tk):
             self._sync_tray_icon()
 
         def fail(msg):
+            if isinstance(msg, tuple):
+                # 部分成功：(ok_names, errs)，成功设备落状态，失败设备回滚
+                ok_names, errs = msg[0], msg[1]
+                for d in ok_names:
+                    self.state[d] = {"on": on, "level": level_key}
+                    self.cards[d].set_state(on, level_key)
+                save_state(self.state)
+                rollback([d for d in DEVICES if d not in ok_names])
+                self.log_lbl.config(
+                    text=t("partial_msg", m=Backend._err_text(errs)))
+                self._sync_tray_icon()
+                return
             self.log_lbl.config(text=t("fail", m=msg))
             rollback()
 
-        self._run_async(lambda: self.backend.set_all(on, lvl),
-                        ok, fail, rollback)
+        self._run_async(
+            lambda: self.backend.set_all(on, lvl, lights if on else None),
+            ok, fail, rollback)
 
     # ---------- 托盘联动 ----------
     def _sync_tray_icon(self):
@@ -1308,7 +1436,7 @@ class App(tk.Tk):
             self.tray.stop()
 
     def open_settings(self):
-        """S6 单例：已有对话框则聚焦，避免 grab_set 冲突。"""
+        """单例：已有对话框则聚焦，避免 grab_set 冲突。"""
         for w in self.winfo_children():
             if isinstance(w, SettingsDialog):
                 w.deiconify()
@@ -1322,7 +1450,7 @@ class App(tk.Tk):
         self.lift()
         self.attributes("-topmost", True)
         self.focus_force()
-        # 短暂置顶后清除，避免永久悬浮（P10）
+        # 短暂置顶后清除，避免永久悬浮
         self.after(400, lambda: self.attributes("-topmost", False))
 
     def _on_close(self):
@@ -1332,7 +1460,7 @@ class App(tk.Tk):
             self.shutdown()
 
     def shutdown(self):
-        """安全退出（不覆盖 Tk 内建 quit，P9）。"""
+        """安全退出（不覆盖 Tk 内建 quit）。"""
         try:
             self.tray.stop()
         except Exception:
@@ -1355,7 +1483,7 @@ class App(tk.Tk):
     def retheme(self):
         th = theme()
         self.configure(bg=th["BG"])
-        # 容器 Frame（P5）+ 注册表遍历（C7）
+        # 容器 Frame + 注册表遍历
         self._top.config(bg=th["BG"])
         self._bot.config(bg=th["BG"])
         fg_by_role = {"title": th["ACCENT"], "backend": th["FG_OK"],
@@ -1367,7 +1495,7 @@ class App(tk.Tk):
                          activebackground=th["HL_BG"], activeforeground=th["FG"])
             elif role in fg_by_role:
                 w.config(fg=fg_by_role[role])
-        # C4: 卡片热改配色，不销毁重建（避免 pack 乱序 + 保留状态）
+        # 卡片热改配色，不销毁重建（避免 pack 乱序 + 保留状态）
         for d in DEVICES:
             self.cards[d].apply_theme()
         self._refresh_status()
