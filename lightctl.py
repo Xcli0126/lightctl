@@ -1352,8 +1352,67 @@ class App(tk.Tk):
         if self.settings.get("tray", True):
             self.tray.start()
 
+        # 固件背光同步：Fn+F11 改的是 asus-nb-wmi 的 brightness，不经过 Aura 协议，
+        # lightctl 的 GUI 不知情。用 inotify 监听 brightness_hw_changed，变化时更新卡片。
+        self._fw_stop = threading.Event()
+        self._fw_thread = threading.Thread(target=self._watch_fw_backlight, daemon=True)
+        self._fw_thread.start()
+
         # 关窗 → 隐藏到托盘（若托盘开），否则退出
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _watch_fw_backlight(self):
+        """监听 /sys/class/leds/asus::kbd_backlight/brightness_hw_changed。
+        Fn+F11 等固件按键改 brightness 后内核会更新这个文件并触发 inotify。"""
+        path = "/sys/class/leds/asus::kbd_backlight/brightness_hw_changed"
+        if not os.path.exists(path):
+            return
+        try:
+            import ctypes
+            libc = ctypes.CDLL("libc.so.6", use_errno=True)
+            IN_MODIFY = 0x00000002
+            fd = libc.inotify_init1(0x800)   # IN_NONBLOCK
+            if fd < 0:
+                return
+            wd = libc.inotify_add_watch(fd, path.encode(), IN_MODIFY)
+            if wd < 0:
+                os.close(fd)
+                return
+            buf = ctypes.create_string_buffer(4096)
+            last = None
+            while not self._fw_stop.is_set():
+                n = libc.read(fd, buf, 4096)
+                if n > 0:
+                    try:
+                        with open(path) as f:
+                            val = int(f.read().strip())
+                    except (OSError, ValueError):
+                        continue
+                    if val != last:
+                        last = val
+                        # 回主线程更新卡片（level 映射：0=off 1=low 2=medium 3=high）
+                        lv = {0: "off", 1: "low", 2: "medium"}.get(val, "high")
+                        self.after(0, self._on_fw_backlight, lv)
+                else:
+                    self._fw_stop.wait(0.3)   # inotify 非阻塞读不到就等一下
+            os.close(fd)
+        except Exception:
+            pass
+
+    def _on_fw_backlight(self, lv):
+        """固件按键改了键盘背光亮度 → 同步 keyboard 卡片与 state.json。"""
+        if self._busy:
+            return
+        st = self.state.get("keyboard", {})
+        if st.get("level") == lv:
+            return
+        on = lv != "off"
+        self.state["keyboard"] = {"on": on, "level": lv}
+        save_state(self.state)
+        self.cards["keyboard"].set_state(on, lv)
+        self.log_lbl.config(
+            text=f"{_dev_label('keyboard')} → {t(lv)}  (Fn+F11)")
+        self._sync_tray_icon()
 
     def _set_window_icon(self):
         p = _icon_path(self._overall_state(), 64)
@@ -1644,7 +1703,15 @@ class App(tk.Tk):
     def shutdown(self):
         """安全退出（不覆盖 Tk 内建 quit）。"""
         try:
+            self._fw_stop.set()
+        except Exception:
+            pass
+        try:
             self.tray.stop()
+        except Exception:
+            pass
+        try:
+            self._single.close()
         except Exception:
             pass
         self.destroy()
