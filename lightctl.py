@@ -454,14 +454,18 @@ class AuraDevice:
                 color=(0, 0, 0), speed="normal",
                 color2=(0, 0, 0)):
         """开灯 + 设色/模式。color=(0,0,0) 表示设备自选色。
-        zone 决定 SetMode 字节（本设备只认自己的 zone）。"""
+        zone 只决定 SetMode 里哪个 zone 用本设备的灯效；
+        实测（2026-10-03）每个物理设备必须发两个 zone 的 SetMode+Commit，
+        只发自己的 zone 会让灯保持全关。与 z13ctl Apply() 的行为一致。"""
         r, g, b = color
         r2, g2, b2 = color2
+        mode_b = MODES[mode]
+        spd = SPEEDS[speed]
         pkts = (self._init_pkts()
-                + [self._power_pkt(*POWER_ON), self._brightness_pkt(level)]
-                + [self._mode_pkt(zone, MODES[mode], r, g, b,
-                                  SPEEDS[speed], r2, g2, b2)]
-                + self._commit_pkts())
+                + [self._power_pkt(*POWER_ON), self._brightness_pkt(level)])
+        for z in (0, 1):
+            pkts += [self._mode_pkt(z, mode_b, r, g, b, spd, r2, g2, b2)]
+            pkts += self._commit_pkts()
         self._write_seq(pkts, delay=0.02)
 
 
