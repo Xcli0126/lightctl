@@ -1164,15 +1164,171 @@ class SettingsDialog(tk.Toplevel):
         self.after(2500, lambda: self._fb_lbl.config(text=""))
 
 
+
+
+class _SingleInstance:
+    """单实例锁：abstract unix socket（Linux 特有，无文件残留）。
+    第二个实例 connect 成功说明已有实例在跑，ok=False。"""
+    def __init__(self):
+        self.ok = True
+        self._srv = None
+        try:
+            import socket
+            path = "\0lightctl-single-instance"   # abstract namespace
+            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                s.connect(path)
+                s.close()
+                self.ok = False   # 已有实例
+                return
+            except OSError:
+                pass   # 没有实例，继续绑定
+            s.close()
+            self._srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            self._srv.bind(path)
+            self._srv.listen(1)
+            self._srv.setblocking(False)
+        except Exception:
+            pass   # 绑定失败不阻塞启动
+
+    def close(self):
+        if self._srv:
+            try:
+                self._srv.close()
+            except Exception:
+                pass
+
+
+class _SingleInstance:
+    """单实例锁：abstract unix socket（Linux 特有，无文件残留）。
+    第二个实例 connect 成功说明已有实例在跑，ok=False。"""
+    def __init__(self):
+        self.ok = True
+        self._srv = None
+        try:
+            import socket
+            path = "\0lightctl-single-instance"   # abstract namespace
+            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                s.connect(path)
+                s.close()
+                self.ok = False   # 已有实例
+                return
+            except OSError:
+                pass   # 没有实例，继续绑定
+            s.close()
+            self._srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            self._srv.bind(path)
+            self._srv.listen(1)
+            self._srv.setblocking(False)
+        except Exception:
+            pass   # 绑定失败不阻塞启动
+
+    def close(self):
+        if self._srv:
+            try:
+                self._srv.close()
+            except Exception:
+                pass
+
+
+def _set_wm_class_by_title(title, res_name, res_class):
+    """按 WM_NAME 扫 root children 找窗口并改 WM_CLASS。
+    Mutter 在 Wayland 下用 x11-frames 代理，Tk 的 winfo_id 不是显示给用户的 toplevel，
+    只能按窗口标题找。找不到就静默跳过。"""
+    try:
+        import ctypes
+        x11 = ctypes.CDLL(ctypes.util.find_library("X11"))
+        x11.XOpenDisplay.restype = ctypes.c_void_p
+        dpy = x11.XOpenDisplay(None)
+        if not dpy:
+            return
+        root = x11.XDefaultRootWindow(dpy)
+        class _Hint(ctypes.Structure):
+            _fields_ = [("res_name", ctypes.c_char_p),
+                        ("res_class", ctypes.c_char_p)]
+        x11.XQueryTree.argtypes = [ctypes.c_void_p, ctypes.c_ulong,
+            ctypes.POINTER(ctypes.c_ulong), ctypes.POINTER(ctypes.c_ulong),
+            ctypes.POINTER(ctypes.POINTER(ctypes.c_ulong)), ctypes.POINTER(ctypes.c_uint)]
+        x11.XFetchName.argtypes = [ctypes.c_void_p, ctypes.c_ulong,
+                                   ctypes.POINTER(ctypes.c_char_p)]
+        x11.XSetClassHint.argtypes = [ctypes.c_void_p, ctypes.c_ulong,
+                                      ctypes.POINTER(_Hint)]
+        want = title.encode("utf-8")
+
+        def _walk(w, depth=0):
+            if depth > 8:
+                return False
+            nm = ctypes.c_char_p()
+            x11.XFetchName(dpy, w, ctypes.byref(nm))
+            if nm.value == want:
+                hint = _Hint(res_name.encode(), res_class.encode())
+                x11.XSetClassHint(dpy, w, ctypes.byref(hint))
+                x11.XFlush(dpy)
+                return True
+            par = ctypes.c_ulong(); rw = ctypes.c_ulong(); n = ctypes.c_uint()
+            kids = ctypes.POINTER(ctypes.c_ulong)()
+            x11.XQueryTree(dpy, w, ctypes.byref(par), ctypes.byref(rw),
+                           ctypes.byref(kids), ctypes.byref(n))
+            for i in range(n.value):
+                if _walk(kids[i], depth + 1):
+                    return True
+            return False
+
+        _walk(root)
+    except Exception:
+        pass
+
+
+def _set_wm_class(win_id, res_name, res_class):
+    """从 X11 侧改窗口的 WM_CLASS（Tk 默认是 "tk"/"Tk"，任务栏按这个显示）。
+    Tk 没有暴露 API，用 ctypes 调 Xlib 的 XSetClassHint。非 X11（纯 Wayland）时静默跳过。
+    注意：Mutter 在 Wayland 下用 x11-frames 代理 X11 窗口，WM_CLASS 可能仍显示 Tk ——
+    这里只改 client window 的属性，尽力而为。"""
+    try:
+        import ctypes
+        x11 = ctypes.CDLL(ctypes.util.find_library("X11"))
+        x11.XOpenDisplay.restype = ctypes.c_void_p
+        dpy = x11.XOpenDisplay(None)
+        if not dpy:
+            return
+        class _Hint(ctypes.Structure):
+            _fields_ = [("res_name", ctypes.c_char_p),
+                        ("res_class", ctypes.c_char_p)]
+        hint = _Hint(res_name.encode(), res_class.encode())
+        x11.XSetClassHint.argtypes = [ctypes.c_void_p, ctypes.c_ulong,
+                                      ctypes.POINTER(_Hint)]
+        x11.XSetClassHint(dpy, win_id, ctypes.byref(hint))
+        x11.XFlush(dpy)
+    except Exception:
+        pass
+
+
 # ---------- UI：主窗口 ----------
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
+        # 单实例锁：防止多开（多个实例叠在一起会让用户觉得"点了没反应"）。
+        # 用 abstract unix socket，第二个实例检测到就激活第一个并退出。
+        self._single = _SingleInstance()
+        if not self._single.ok:
+            self._primary_exists = True
+            return
+        self._primary_exists = False
         self.settings = load_settings()
         set_lang(self.settings.get("lang", "zh"))
         set_theme(self.settings.get("theme", "dark"))
 
         self.title(t("app_title"))
+        # WM_CLASS：Tk 默认是 "tk"/"Tk"，窗口管理器/任务栏按这个显示名字。
+        # Tk 没有暴露 API，从 X11 侧用 XSetClassHint 改。
+        # winfo_id() 返回的是 Tk 内部 frame，不是 Mutter 显示的 toplevel ——
+        # 用 XFetchName 扫 root children 找 WM_NAME=窗口标题的那个窗口。
+        # 窗口映射后再改（Mutter 的 frame 创建在 map 之后），用 after 延迟。
+        # 必须在 title() 设好之后注册，否则回调拿到的是默认 "tk #2"。
+        def _apply_wm_class():
+            _set_wm_class_by_title(self.title(), APP_NAME, APP_NAME.capitalize())
+        self.after(200, _apply_wm_class)
         self.resizable(False, False)
         th = theme()
         self.configure(bg=th["BG"])
@@ -1330,18 +1486,40 @@ class App(tk.Tk):
         self._busy = True
         self.log_lbl.config(text=t("executing"))
 
+        # 超时兜底：硬件写入正常 <1s；若 worker 卡死（如 after 抛非 TclError），
+        # 8 秒后强制复位 _busy 并报错，避免 GUI 永久"执行中…"。
+        self._async_done = False
+
+        def _watchdog():
+            if self._async_done:
+                return
+            self._async_done = True
+            self._busy = False
+            try:
+                self.log_lbl.config(text=t("fail", m="timeout"))
+                rollback()
+            except tk.TclError:
+                pass
+        try:
+            self.after(8000, _watchdog)
+        except tk.TclError:
+            pass
+
         def worker():
             try:
                 ok, msg = call()
             except Exception as e:   # 兜底：任何异常都必须复位 _busy
                 ok, msg = False, f"{type(e).__name__}: {e}"
             def done():
+                if self._async_done:
+                    return
+                self._async_done = True
                 self._busy = False
                 (on_ok if ok else on_fail)(msg)
             try:
                 self.after(0, done)
-            except tk.TclError:
-                pass   # 窗口已销毁，忽略
+            except (tk.TclError, RuntimeError):
+                pass   # 窗口已销毁或 mainloop 没跑，忽略
         threading.Thread(target=worker, daemon=True).start()
 
     def _exec(self, dev, on, level):
@@ -1570,6 +1748,14 @@ def main():
     if args.selftest:
         raise SystemExit(selftest())
     app = App()
+    if getattr(app, "_primary_exists", False):
+        # 已有实例在跑：销毁这个半成品窗口，提示后退出
+        try:
+            app.destroy()
+        except tk.TclError:
+            pass
+        sys.stderr.write("lightctl: 已有实例在运行，激活已有窗口。\n")
+        raise SystemExit(0)
     try:
         app.update_idletasks()
         if args.geometry:
