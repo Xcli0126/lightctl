@@ -63,6 +63,8 @@ PID_KEYBOARD = "1A30"
 DEVICES = ("rear", "keyboard")
 
 LEVELS = ["off", "low", "medium", "high"]
+LANGS = ["zh", "en"]
+THEMES = ["dark", "light"]
 # 档位名 -> 协议里的数值（off/low/medium/high = 0/1/2/3）
 LEVEL_NUM = {name: i for i, name in enumerate(LEVELS)}
 
@@ -114,7 +116,7 @@ _STRINGS = {
         "mode_static": "常亮", "mode_breathe": "呼吸",
         "mode_cycle": "循环", "mode_rainbow": "彩虹", "mode_strobe": "频闪",
         "speed": "速度", "speed_slow": "慢", "speed_normal": "中", "speed_fast": "快",
-        "auto_color": "自动", "pick_color": "取色",
+        "pick_color": "取色",
         "on": "开", "off": "关",
         "low": "低", "medium": "中", "high": "高",
         "all_on": "全部打开", "all_off": "全部关闭",
@@ -139,22 +141,22 @@ _STRINGS = {
         "autostart": "开机自启动",
         "theme": "主题",
         "theme_dark": "深色", "theme_light": "浅色",
-        "save": "保存", "cancel": "取消",
+
         "close": "关闭", "quit": "退出",
         "show_win": "显示主窗口", "hide_win": "隐藏主窗口",
-        "tray_on": "灯光已开", "tray_off": "灯光已关",
-        "tray_partial": "部分灯光已关",
+
+
         "err_no_dev": "未找到 Aura 设备，请检查 udev 规则。",
         "err_busy": "硬件无响应（上一次写入卡住了），请重启 lightctl",
         "err_gone": "设备已断开，点「刷新状态」重新扫描",
         "version": "版本",
         "rear_zone": "后盖灯", "kbd_zone": "键盘灯",
         "state_on": "开", "state_off": "关",
-        "tray_tip": "lightctl 灯光控制",
-        "err_generic": "操作失败",
+
+
         "autostart_on": "已开启开机自启", "autostart_off": "已关闭开机自启",
-        "need_restart": "语言/主题改动即时生效",
-        "about": "关于", "ok": "确定",
+
+
     },
     "en": {
         "app_title": "lightctl — Z13 Lighting Control",
@@ -167,7 +169,7 @@ _STRINGS = {
         "mode_static": "Static", "mode_breathe": "Breathe",
         "mode_cycle": "Cycle", "mode_rainbow": "Rainbow", "mode_strobe": "Strobe",
         "speed": "Speed", "speed_slow": "Slow", "speed_normal": "Normal", "speed_fast": "Fast",
-        "auto_color": "Auto", "pick_color": "Pick",
+        "pick_color": "Pick",
         "on": "On", "off": "Off",
         "low": "Low", "medium": "Medium", "high": "High",
         "all_on": "All on", "all_off": "All off",
@@ -192,22 +194,22 @@ _STRINGS = {
         "autostart": "Start on login",
         "theme": "Theme",
         "theme_dark": "Dark", "theme_light": "Light",
-        "save": "Save", "cancel": "Cancel",
+
         "close": "Close", "quit": "Quit",
         "show_win": "Show main window", "hide_win": "Hide main window",
-        "tray_on": "Lights on", "tray_off": "Lights off",
-        "tray_partial": "Some lights off",
+
+
         "err_no_dev": "No Aura device found. Check udev rules.",
         "err_busy": "Hardware not responding (a previous write is stuck); restart lightctl",
         "err_gone": "Device disconnected; press Refresh to rescan",
         "version": "Version",
         "rear_zone": "Rear", "kbd_zone": "Keyboard",
         "state_on": "On", "state_off": "Off",
-        "tray_tip": "lightctl lighting control",
-        "err_generic": "Operation failed",
+
+
         "autostart_on": "Autostart enabled", "autostart_off": "Autostart disabled",
-        "need_restart": "Language/theme changes apply immediately",
-        "about": "About", "ok": "OK",
+
+
     },
 }
 
@@ -223,16 +225,41 @@ def t(key, **kw):
 
 
 def _i18n_check():
-    """zh/en key sets match, and every t() literal exists."""
+    """zh/en 键集合一致，且源码里用到的键都存在。
+
+    覆盖五种用法（以前只扫第一种，于是"翻译缺失"会从自测里溜过去）。
+    注意：这段文档本身也会被正则扫到，所以这里不写任何形如调用的示例。
+      1. 翻译调用：单双引号、带不带参数都算；
+      2. 三元写法：if/else 两个分支都算；
+      3. 前缀加变量拼接：静态扫不到，按已知前缀枚举；
+      4. 控件的 i18n 键属性（retranslate 靠它定位）；
+      5. 设置页那两行辅助函数直接传的键名。
+    """
     import re as _re
     zh, en = set(_STRINGS["zh"]), set(_STRINGS["en"])
     if zh != en:
-        raise AssertionError("i18n mismatch")
+        raise AssertionError("i18n mismatch: %r" % sorted(zh ^ en))
     src = open(__file__, encoding="utf-8").read()
-    # 只扫直接闭合的静态键；动态拼接（前缀 + 变量）跳过
-    for m in _re.findall(r'(?<![A-Za-z_.])t\(\s*"([a-z_0-9]+)"\s*\)', src):
-        if m not in zh:
-            raise AssertionError("missing i18n key: " + m)
+    used = set(_re.findall(r'''(?<![A-Za-z_.])t\(\s*["']([a-z_0-9]+)["']''', src))
+    for pair in _re.findall(
+            r'''t\(\s*["']([a-z_0-9]+)["']\s+if\s+[^)]*?else\s+["']([a-z_0-9]+)["']''',
+            src):
+        used.update(pair)
+    used |= set(_re.findall(r'''_i18n_key = ["']([a-z_0-9]+)["']''', src))
+    used |= set(_re.findall(
+        r'''_(?:row|check)\(\s*self,\s*["']([a-z_0-9]+)["']''', src))
+    dynamic = (("mode_", MODE_LIST), ("speed_", SPEED_LIST),
+               ("lang_", LANGS), ("theme_", THEMES),
+               ("autostart_", ("on", "off")),
+               ("", tuple(LEVELS) + ("rear_name", "kbd_name")))
+    # 源码里 t("mode_" + m) 这种会让人只扫到裸前缀 mode_，它不是键，去掉；
+    # 完整的键由下面这轮枚举负责。
+    used = {k for k in used if k not in {p for p, _ in dynamic if p}}
+    for prefix, values in dynamic:
+        used |= {prefix + v for v in values}
+    missing = sorted(k for k in used if k not in zh)
+    if missing:
+        raise AssertionError("missing i18n key: " + ", ".join(missing))
 
 
 def _dev_label(dev):
@@ -313,6 +340,12 @@ def load_state():
     """
     first_run = not os.path.exists(STATE_FILE)
     raw = _read_json(STATE_FILE, {})
+    old_schema = raw.get("schema")
+    if old_schema is not None and old_schema != STATE_SCHEMA:
+        # 兼容靠下面的白名单取值（未知键丢弃、坏值回落默认），
+        # 这里只把版本变化记一笔，免得 schema 号写进文件却从没人读。
+        sys.stderr.write(
+            f"lightctl: state schema {old_schema} -> {STATE_SCHEMA}\n")
     out = {"schema": STATE_SCHEMA}
     for d in DEVICES:
         v = raw.get(d)
@@ -501,7 +534,7 @@ class AuraDevice:
                                  self._brightness_pkt(0)],
             delay=0.02)
 
-    def turn_on(self, level=3, mode="static",
+    def turn_on(self, brightness=3, mode="static",
                 color=(0, 0, 0), speed="normal",
                 color2=(0, 0, 0)):
         """开灯 + 设色/模式。color=(0,0,0) 表示设备自选色。
@@ -514,7 +547,7 @@ class AuraDevice:
         mode_b = MODES[mode]
         spd = SPEEDS[speed]
         pkts = (self._init_pkts()
-                + [self._power_pkt(*POWER_ON), self._brightness_pkt(level)])
+                + [self._power_pkt(*POWER_ON), self._brightness_pkt(brightness)])
         for z in (0, 1):
             pkts += [self._mode_pkt(z, mode_b, r, g, b, spd, r2, g2, b2)]
             pkts += self._commit_pkts()
@@ -546,7 +579,7 @@ class Backend:
                 return t("err_perm", p=path or "")
         return t("err_no_dev")
 
-    def _apply(self, names, on, level, light=None):
+    def _apply(self, names, on, brightness, light=None):
         """取锁→遍历→turn→收集结果。
 
         light: dict(name -> {mode/color/speed})，逐设备取自己的灯效，仅 on=True 时用。
@@ -560,7 +593,7 @@ class Backend:
         if not self._lock.acquire(timeout=3):
             return [], [(n, "busy") for n in names]
         try:
-            ok_names, errs = self._sweep(names, on, level, light)
+            ok_names, errs = self._sweep(names, on, brightness, light)
         finally:
             self._lock.release()
         # 磁吸键盘重插后 hidraw 号会变。设备刚消失时重扫一次再试一遍，
@@ -570,13 +603,17 @@ class Backend:
             if not self._lock.acquire(timeout=3):
                 return [], [(n, "busy") for n in names]
             try:
-                ok_names, errs = self._sweep(names, on, level, light)
+                ok_names, errs = self._sweep(names, on, brightness, light)
             finally:
                 self._lock.release()
         return ok_names, errs
 
-    def _sweep(self, names, on, level, light):
-        """已持锁：逐个设备下发，收集 (ok_names, errs)。"""
+    def _sweep(self, names, on, brightness, light):
+        """已持锁：逐个设备下发，收集 (ok_names, errs)。
+
+        brightness 是协议数值（0-3），可以是单个 int，也可以是
+        {设备名: int}（"全部打开"时逐设备取档位）。
+        """
         errs, ok_names = [], []
         for name in names:
             if name not in self.nodes:
@@ -584,8 +621,8 @@ class Backend:
                 continue
             dev = AuraDevice(self.nodes[name])
             cfg = light.get(name) or {}
-            # level 可以是单个 int，也可以是 {设备名: int}（"全部打开"时逐设备取档位）
-            lvl = level.get(name, 3) if isinstance(level, dict) else level
+            lvl = (brightness.get(name, 3) if isinstance(brightness, dict)
+                   else brightness)
             color = cfg.get("color", (0, 0, 0))
             if name == "keyboard" and color == (0, 0, 0):
                 # 键盘区给"设备自选色"(rand=0xFF) 实测会一直全黑
@@ -627,16 +664,16 @@ class Backend:
             return f"{_dev_label(n)}: {r}"
         return "; ".join(one(n, r) for n, r in errs)
 
-    def set_device(self, name, on, level=3, light=None):
-        ok_names, errs = self._apply([name], on, level, light)
+    def set_device(self, name, on, brightness=3, light=None):
+        ok_names, errs = self._apply([name], on, brightness, light)
         if not ok_names:
             if all(r == "missing" for _, r in errs):
                 return False, self.no_dev_msg([n for n, _ in errs])
             return False, self._err_text(errs)
         return True, f"{_dev_label(name)} → {t('state_on' if on else 'state_off')}"
 
-    def set_all(self, on, level=3, light=None):
-        ok_names, errs = self._apply(DEVICES, on, level, light)
+    def set_all(self, on, brightness=3, light=None):
+        ok_names, errs = self._apply(DEVICES, on, brightness, light)
         if not errs:
             return True, t("all_on_msg") if on else t("all_off_msg")
         if not ok_names:
@@ -885,7 +922,7 @@ def _lbl(parent, text, bg, fg, font=("Sans", 10)):
     return tk.Label(parent, text=text, bg=bg, fg=fg, font=font)
 
 
-def _btn(parent, text, cmd, bg, fg, hl, width=4, padx=(0, 6)):
+def _btn(parent, text, cmd, bg, fg, hl, width=4):
     return tk.Button(parent, text=text, width=width, command=cmd,
                      bg=bg, fg=fg, relief="flat", padx=2, pady=2,
                      activebackground=hl, activeforeground=fg)
@@ -896,6 +933,24 @@ def _combo(parent, var, values, cb, width=5):
                      state="readonly", width=width, font=("Sans", 10))
     c.bind("<<ComboboxSelected>>", cb)
     return c
+
+
+def _walk_children(root):
+    """递归收集所有子控件（主题/语言刷新靠它遍历）。"""
+    out = []
+    for c in root.winfo_children():
+        out.append(c)
+        out.extend(_walk_children(c))
+    return out
+
+
+def _key_of(labels, codes, shown, default):
+    """显示文本 → 代码值（找不到就回落 default）。
+
+    下拉/单选的显示值是翻译过的文本，反查必须用同一份 labels；
+    这段逻辑以前在卡片里重复了三遍，设置页还另有一份。
+    """
+    return codes[labels.index(shown)] if shown in labels else default
 
 
 class Card:
@@ -1013,22 +1068,18 @@ class Card:
         self.on_change(self.dev, "toggle", self.on_key == "on")
 
     def _level(self, _e=None):
-        # 由当前显示文本反查 key（值集顺序与 LEVELS 一致）
-        idx = [t(x) for x in LEVELS].index(self.lv_var.get()) \
-            if self.lv_var.get() in [t(x) for x in LEVELS] else 3
-        self.lv_key = LEVELS[idx]
+        self.lv_key = _key_of([t(x) for x in LEVELS], LEVELS,
+                              self.lv_var.get(), "high")
         self.on_change(self.dev, "level", self.lv_key)
 
     def _mode(self, _e=None):
-        idx = [t("mode_" + m) for m in MODE_LIST].index(self.mode_var.get()) \
-            if self.mode_var.get() in [t("mode_" + m) for m in MODE_LIST] else 0
-        self.mode_key = MODE_LIST[idx]
+        self.mode_key = _key_of([t("mode_" + m) for m in MODE_LIST],
+                                MODE_LIST, self.mode_var.get(), "static")
         self.on_change(self.dev, "light", None)
 
     def _speed(self, _e=None):
-        idx = [t("speed_" + s) for s in SPEED_LIST].index(self.speed_var.get()) \
-            if self.speed_var.get() in [t("speed_" + s) for s in SPEED_LIST] else 1
-        self.speed_key = SPEED_LIST[idx]
+        self.speed_key = _key_of([t("speed_" + s) for s in SPEED_LIST],
+                                 SPEED_LIST, self.speed_var.get(), "normal")
         self.on_change(self.dev, "light", None)
 
     @staticmethod
@@ -1117,11 +1168,12 @@ class Card:
         else:
             self.color_sw.config(bg="#%02x%02x%02x" % self.color)
 
-    def set_state(self, on, level):
+    def set_state(self, on, level_key):
+        # level_key 是档位名（off/low/medium/high）；协议侧的 int 档位叫 brightness
         self.on_key = "on" if on else "off"
-        self.lv_key = level
+        self.lv_key = level_key
         self.sw_var.set(t(self.on_key))
-        self.lv_var.set(t(level))
+        self.lv_var.set(t(level_key))
         # 同步模式/速度/颜色控件
         if hasattr(self, "mode_var"):
             self.mode_var.set(t("mode_" + self.mode_key))
@@ -1156,7 +1208,7 @@ class Card:
         th = theme()
         self.frame.config(bg=th["CARD_BG"], fg=th["FG"])
         presets = {id(b) for b, _ in getattr(self, "preset_btns", [])}
-        for w in self._walk(self.frame):
+        for w in _walk_children(self.frame):
             if id(w) in presets:
                 continue          # 预设色块要保持本色，不跟主题走
             cls = w.winfo_class()
@@ -1179,13 +1231,7 @@ class Card:
         # 徽章色按当前状态
         self.set_state(self.on_key == "on", self.lv_key)
 
-    @staticmethod
-    def _walk(w):
-        out = []
-        for c in w.winfo_children():
-            out.append(c)
-            out.extend(Card._walk(c))
-        return out
+
 
 
 
@@ -1234,8 +1280,8 @@ class SettingsDialog(tk.Toplevel):
         pad = {"padx": 16, "pady": 8}
 
         # 语言 / 主题：下拉显示翻译文本，内部反查回代码值
-        self.lang_codes = ["zh", "en"]
-        self.theme_codes = ["dark", "light"]
+        self.lang_codes = LANGS
+        self.theme_codes = THEMES
         self.lang_var = tk.StringVar(
             value=t("lang_" + s.get("lang", "zh")))
         _row(self, "language", self.lang_var,
@@ -1285,7 +1331,7 @@ class SettingsDialog(tk.Toplevel):
         # 下拉的候选值也要跟着语言换，否则选中值变了、展开还是旧语言
         for combo, keys in getattr(self, "_combos", []):
             combo.config(values=[t(k) for k in keys])
-        for w in self._all_widgets(self):
+        for w in _walk_children(self):
             key = getattr(w, "_i18n_key", None)
             if not key:
                 continue
@@ -1298,7 +1344,7 @@ class SettingsDialog(tk.Toplevel):
         """对话框跟随主题（bg + 控件配色）。"""
         th = theme()
         self.configure(bg=th["BG"])
-        for w in self._all_widgets(self):
+        for w in _walk_children(self):
             try:
                 cls = w.winfo_class()
             except Exception:
@@ -1317,21 +1363,9 @@ class SettingsDialog(tk.Toplevel):
             elif cls == "Frame":
                 w.config(bg=th["BG"])
 
-    @staticmethod
-    def _all_widgets(w):
-        out = []
-        for c in w.winfo_children():
-            out.append(c)
-            out.extend(SettingsDialog._all_widgets(c))
-        return out
-
-    @staticmethod
-    def _code_of(labels, codes, shown, default):
-        """显示文本 → 代码值（找不到就回落 default）。"""
-        return codes[labels.index(shown)] if shown in labels else default
 
     def _on_lang(self, _e=None):
-        self.app.settings["lang"] = self._code_of(
+        self.app.settings["lang"] = _key_of(
             [t("lang_" + c) for c in self.lang_codes],
             self.lang_codes, self.lang_var.get(), "zh")
         self._save()
@@ -1340,7 +1374,7 @@ class SettingsDialog(tk.Toplevel):
         self.retranslate()
 
     def _on_theme(self, _e=None):
-        self.app.settings["theme"] = self._code_of(
+        self.app.settings["theme"] = _key_of(
             [t("theme_" + c) for c in self.theme_codes],
             self.theme_codes, self.theme_var.get(), "dark")
         self._save()
@@ -1541,9 +1575,8 @@ class App(tk.Tk):
         self.configure(bg=th["BG"])
 
         self.backend = Backend()
+        # load_state 保证 DEVICES 里每个设备都有完整条目，不必再补默认值
         self.state, self._first_run = load_state()
-        for d in DEVICES:
-            self.state.setdefault(d, {"on": True, "level": "high"})
 
         self._set_window_icon()
 
@@ -1746,9 +1779,9 @@ class App(tk.Tk):
                     errs.append(msg)
             return (not errs), ("; ".join(errs) if errs else "")
 
+        # set_device 失败时的 msg 一定非空，不用再判空
         self._run_async(call, lambda m: None,
-                        lambda m: self.log_lbl.config(text=t("fail", m=m))
-                        if m else None,
+                        lambda m: self.log_lbl.config(text=t("fail", m=m)),
                         lambda: None)
 
     def _refresh_status(self):
@@ -1780,12 +1813,12 @@ class App(tk.Tk):
             st["color"] = list(c.color)
         return st
 
-    def _mark(self, dev, on, level):
+    def _mark(self, dev, on, level_key):
         """把某设备的开关/档位同时落到 state 与卡片上（不写盘）。"""
         st = self._remember_light(dev)
         st["on"] = on
-        st["level"] = level
-        self.cards[dev].set_state(on, level)
+        st["level"] = level_key
+        self.cards[dev].set_state(on, level_key)
 
     def _on_change(self, dev, kind, value, _retry=0):
         if kind == "toggle":
@@ -1886,8 +1919,8 @@ class App(tk.Tk):
                 pass   # 窗口已销毁或 mainloop 没跑，忽略
         threading.Thread(target=worker, daemon=True).start()
 
-    def _exec(self, dev, on, level):
-        lvl_num = LEVEL_NUM.get(level, 3)
+    def _exec(self, dev, on, level_key):
+        lvl_num = LEVEL_NUM.get(level_key, 3)
         c = self.cards.get(dev)
         # 必须按设备名嵌套：Backend._apply 用 light.get(name) 取本设备的灯效，
         # 传扁平字典会返回 None → 颜色/模式/速度被静默丢掉退回默认，
@@ -1899,10 +1932,10 @@ class App(tk.Tk):
             self.cards[dev].set_state(st.get("on", True), st.get("level", "high"))
 
         def ok(msg):
-            self._mark(dev, on, level)
+            self._mark(dev, on, level_key)
             save_state(self.state)
             self.log_lbl.config(
-                text=f"{_dev_label(dev)} → {t(level if on else 'off')}")
+                text=f"{_dev_label(dev)} → {t(level_key if on else 'off')}")
             self._sync_tray_icon()
 
         def fail(msg):
