@@ -1352,8 +1352,9 @@ class App(tk.Tk):
         if self.settings.get("tray", True):
             self.tray.start()
 
-        # 固件背光同步：Fn+F11 改的是 asus-nb-wmi 的 brightness，不经过 Aura 协议，
-        # lightctl 的 GUI 不知情。用 inotify 监听 brightness_hw_changed，变化时更新卡片。
+        # 固件背光同步：Fn+F11 会把 /sys/class/leds/asus::kbd_backlight/brightness
+        # 顶上去（实测与 brightness_hw_changed 同步变化）。但本机 hid-asus 没注册
+        # 背光监听，内核这一步写不到硬件，只有 Aura 通道能真正改亮度。
         self._fw_stop = threading.Event()
         self._fw_thread = threading.Thread(target=self._watch_fw_backlight, daemon=True)
         self._fw_thread.start()
@@ -1362,56 +1363,36 @@ class App(tk.Tk):
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def _watch_fw_backlight(self):
-        """监听 /sys/class/leds/asus::kbd_backlight/brightness_hw_changed。
-        Fn+F11 等固件按键改 brightness 后内核会更新这个文件并触发 inotify。"""
-        path = "/sys/class/leds/asus::kbd_backlight/brightness_hw_changed"
-        if not os.path.exists(path):
-            return
-        try:
-            import ctypes
-            libc = ctypes.CDLL("libc.so.6", use_errno=True)
-            IN_MODIFY = 0x00000002
-            fd = libc.inotify_init1(0x800)   # IN_NONBLOCK
-            if fd < 0:
-                return
-            wd = libc.inotify_add_watch(fd, path.encode(), IN_MODIFY)
-            if wd < 0:
-                os.close(fd)
-                return
-            buf = ctypes.create_string_buffer(4096)
-            last = None
-            while not self._fw_stop.is_set():
-                n = libc.read(fd, buf, 4096)
-                if n > 0:
-                    try:
-                        with open(path) as f:
-                            val = int(f.read().strip())
-                    except (OSError, ValueError):
-                        continue
-                    if val != last:
-                        last = val
-                        # 回主线程更新卡片（level 映射：0=off 1=low 2=medium 3=high）
-                        lv = {0: "off", 1: "low", 2: "medium"}.get(val, "high")
-                        self.after(0, self._on_fw_backlight, lv)
-                else:
-                    self._fw_stop.wait(0.3)   # inotify 非阻塞读不到就等一下
-            os.close(fd)
-        except Exception:
-            pass
+        """轮询 /sys/class/leds/asus::kbd_backlight/brightness。
 
-    def _on_fw_backlight(self, lv):
-        """固件按键改了键盘背光亮度 → 同步 keyboard 卡片与 state.json。"""
+        Fn+F11 会更新这个节点（实测与 brightness_hw_changed 同步变化），
+        本机 hid-asus 没有注册背光监听，内核那一步写不到硬件 ——
+        所以读到变化后要用还活着的 Aura 通道把亮度真正打下去。
+        轮询而非 inotify：既覆盖按键，也覆盖 probe/resume 时的被动变化。
+        """
+        path = "/sys/class/leds/asus::kbd_backlight/brightness"
+        applied = None
+        while not self._fw_stop.is_set():
+            try:
+                with open(path) as f:
+                    val = int(f.read().strip())
+            except (OSError, ValueError):
+                self._fw_stop.wait(0.3)
+                continue
+            if applied is None:
+                applied = val          # 启动时先对齐，别把开机状态当成按键
+            elif val != applied:
+                applied = val
+                # 回主线程：0=off 1=low 2=medium 3=high
+                lv = {0: "off", 1: "low", 2: "medium"}.get(val, "high")
+                self.after(0, self._on_fw_backlight, lv, val)
+            self._fw_stop.wait(0.3)
+
+    def _on_fw_backlight(self, lv, raw):
+        """Fn+F11 改了固件侧亮度 → 更新卡片，并用 Aura 把物理亮度打下去。"""
         if self._busy:
-            return
-        st = self.state.get("keyboard", {})
-        cur_on = bool(st.get("on", False))
-        if st.get("level") == lv:
-            return
-        if lv == "off" and cur_on:
-            # 固件读数停在 0（Aura 写入不会动 brightness_hw_changed），
-            # 与 GUI 刚下的开灯冲突 → 视为过期读数，不覆盖 GUI 状态。
-            self.log_lbl.config(
-                text=f"{_dev_label('keyboard')} → {t('state_on')}  (固件读数未变，保持)")
+            # 上一次写入还没回来，稍后重试，别把这次按键吞掉
+            self.after(150, lambda: self._on_fw_backlight(lv, raw))
             return
         on = lv != "off"
         self.state["keyboard"] = {"on": on, "level": lv}
@@ -1420,6 +1401,17 @@ class App(tk.Tk):
         self.log_lbl.config(
             text=f"{_dev_label('keyboard')} → {t(lv)}  (Fn+F11)")
         self._sync_tray_icon()
+        # 内核那条路在本机是断的（hid-asus 未注册背光监听），
+        # 只有 Aura 能真正改亮度；写失败只记日志，不回滚按键结果。
+        c = self.cards.get("keyboard")
+        light = {"mode": getattr(c, "mode_key", "static"),
+                 "color": getattr(c, "color", (0, 0, 0)),
+                 "speed": getattr(c, "speed_key", "normal")}
+        self._run_async(
+            lambda: self.backend.set_device("keyboard", on, raw, light),
+            lambda m: None,
+            lambda m: self.log_lbl.config(text=t("fail", m=m)),
+            lambda: None)
 
     def _set_window_icon(self):
         p = _icon_path(self._overall_state(), 64)
