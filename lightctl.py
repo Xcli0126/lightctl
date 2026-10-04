@@ -507,11 +507,17 @@ class Backend:
                 cfg = light.get(name) or {}
                 try:
                     if on:
+                        color = cfg.get("color", (0, 0, 0))
+                        if name == "keyboard" and color == (0, 0, 0):
+                            # 键盘区给"设备自选色"(rand=0xFF) 实测会一直全黑
+                            # （2026-10-04 对照实验），退回白色 —— 键盘本来就是
+                            # 单色背光，auto 在这里没有意义。
+                            color = (255, 255, 255)
                         dev.turn_on(
                             level,
                             zone=DEVICE_ZONE.get(name, 0),
                             mode=cfg.get("mode", "static"),
-                            color=cfg.get("color", (0, 0, 0)),
+                            color=color,
                             speed=cfg.get("speed", "normal"),
                             color2=cfg.get("color2", (0, 0, 0)))
                     else:
@@ -805,7 +811,9 @@ class Card:
         self.on_key, self.lv_key = "on", "high"   # 卡片只存 key，显示时再翻译
         self.mode_key = "static"
         self.speed_key = "normal"
-        self.color = (0, 0, 0)   # (0,0,0)=设备自选色
+        # 默认给显式白色。(0,0,0) 表示"设备自选色"（Aura rand=0xFF），
+        # 但 2026-10-04 实测：rand=0xFF 时本机键盘区不亮，键盘区必须给具体颜色。
+        self.color = (255, 255, 255)
         th = theme()
         self.frame = tk.LabelFrame(
             parent, text=" " + _dev_label(dev) + " ",
@@ -852,7 +860,7 @@ class Card:
         # 颜色：hex 输入 + 色块预览
         r5 = tk.Frame(self.frame, bg=th["CARD_BG"]); r5.pack(fill="x", pady=(8, 0))
         _lbl(r5, t("color"), th["CARD_BG"], th["FG_DIM"]).pack(side="left")
-        self.color_var = tk.StringVar(value="auto")
+        self.color_var = tk.StringVar(value=self._color_str())
         self.color_entry = tk.Entry(r5, textvariable=self.color_var, width=9,
                                     bg=th["ENTRY_BG"], fg=th["FG"],
                                     insertbackground=th["FG"],
