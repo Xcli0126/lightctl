@@ -35,7 +35,7 @@ errno_EACCES = _errno.EACCES
 errno_EPERM = _errno.EPERM
 
 APP_NAME = "lightctl"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 CONFIG_DIR = os.path.expanduser("~/.config/lightctl")
 STATE_FILE = os.path.join(CONFIG_DIR, "state.json")
 SETTINGS_FILE = os.path.join(CONFIG_DIR, "settings.json")
@@ -59,10 +59,10 @@ BRIGHT_HDR = (0xC5, 0xC4)
 PID_REAR = "18C6"
 PID_KEYBOARD = "1A30"
 DEVICES = ("rear", "keyboard")
-# 每个设备只认自己 zone 的 SetMode 字节（后盖/灯条=1，键盘=0）
-DEVICE_ZONE = {"rear": 1, "keyboard": 0}
 
 LEVELS = ["off", "low", "medium", "high"]
+# 档位名 -> 协议里的数值（off/low/medium/high = 0/1/2/3）
+LEVEL_NUM = {name: i for i, name in enumerate(LEVELS)}
 
 # Aura 灯效模式（mode 字节值）与速度（speed 字节值）
 MODES = {"static": 0, "breathe": 1, "cycle": 2, "rainbow": 3, "strobe": 10}
@@ -473,12 +473,14 @@ class AuraDevice:
                                  self._brightness_pkt(0)],
             delay=0.02)
 
-    def turn_on(self, level=3, zone=0, mode="static",
+    def turn_on(self, level=3, mode="static",
                 color=(0, 0, 0), speed="normal",
                 color2=(0, 0, 0)):
         """开灯 + 设色/模式。color=(0,0,0) 表示设备自选色。
-        实测（2026-10-03）每个物理设备必须发两个 zone 的 SetMode+Commit，
-        只发自己的 zone 会让灯保持全关。与 z13ctl Apply() 的行为一致。"""
+
+        两个 zone 都发同一套灯效，不做区分 —— 固件不按 zone 过滤，分 zone 发
+        是多余的。实测（2026-10-03）：每个物理设备必须发两个 zone 的
+        SetMode+Commit，只发一个 zone 会让灯保持全关；与 z13ctl Apply() 一致。"""
         r, g, b = color
         r2, g2, b2 = color2
         mode_b = MODES[mode]
@@ -501,13 +503,15 @@ class Backend:
             self.nodes, self.denied = find_aura_nodes()
         return self.nodes
 
-    @staticmethod
-    def no_dev_msg():
-        """一个节点都没有时，区分"权限不足"与"设备不存在"。"""
-        nodes, denied = find_aura_nodes()
-        if nodes:
+    def no_dev_msg(self):
+        """一个节点都没有时，区分"权限不足"与"设备不存在"。
+
+        直接用构造/refresh() 时缓存下来的 nodes 与 denied —— 这里再扫一遍
+        hidraw 是白费功夫（每扫一次都要 open + ioctl 所有 0B05 节点）。
+        """
+        if self.nodes:
             return t("err_no_dev")
-        for name, (path, errno) in denied.items():
+        for path, errno in self.denied.values():
             if errno in (errno_EACCES, errno_EPERM):
                 return t("err_perm", p=path)
         return t("err_no_dev")
@@ -537,7 +541,6 @@ class Backend:
                             color = (255, 255, 255)
                         dev.turn_on(
                             level,
-                            zone=DEVICE_ZONE.get(name, 0),
                             mode=cfg.get("mode", "static"),
                             color=color,
                             speed=cfg.get("speed", "normal"),
@@ -1009,6 +1012,11 @@ class Card:
         if hasattr(self, "color_var"):
             self.color_var.set(self._color_str())
             self._sync_sw()
+
+    def light_cfg(self):
+        """本卡片当前的灯效，直接喂给 Backend（它按设备名取用）。"""
+        return {"mode": self.mode_key, "color": self.color,
+                "speed": self.speed_key}
 
     def _color_str(self):
         if self.color == (0, 0, 0):
@@ -1617,16 +1625,13 @@ class App(tk.Tk):
         不重放就会出现"卡片写着开、灯却是灭的"。
         两个设备放在同一次后台调用里，避免撞 _busy。
         """
-        lv_num = {"off": 0, "low": 1, "medium": 2, "high": 3}
-        plan = {}
-        lights = {}
+        plan, lights = {}, {}
         for d in DEVICES:
             st = self.state.get(d, {})
             on = bool(st.get("on", True))
-            plan[d] = (on, lv_num.get(st.get("level", "high"), 3) if on else 0)
-            c = self.cards[d]
-            lights[d] = {"mode": c.mode_key, "color": c.color,
-                         "speed": c.speed_key}
+            lv = LEVEL_NUM.get(st.get("level", "high"), 3) if on else 0
+            plan[d] = (on, lv)
+            lights[d] = self.cards[d].light_cfg()
 
         def call():
             errs = []
@@ -1648,7 +1653,7 @@ class App(tk.Tk):
         missing = [d for d in DEVICES if d not in nodes]
         if not parts:
             # 一个 Aura 设备都没找到：权限不足和设备不存在要分清
-            self.status_lbl.config(text=Backend.no_dev_msg())
+            self.status_lbl.config(text=self.backend.no_dev_msg())
         else:
             txt = t("status_fmt", n=len(parts), list="  ".join(parts))
             if missing:
@@ -1744,16 +1749,12 @@ class App(tk.Tk):
         threading.Thread(target=worker, daemon=True).start()
 
     def _exec(self, dev, on, level):
-        lvl_num = {"off": 0, "low": 1, "medium": 2, "high": 3}.get(level, 3)
+        lvl_num = LEVEL_NUM.get(level, 3)
         c = self.cards.get(dev)
-        light = None
-        if c is not None and on:
-            # 必须按设备名嵌套！Backend._apply 用 light.get(name) 取本设备的灯效，
-            # 传扁平字典会返回 None → 颜色/模式/速度被静默丢掉退回默认，
-            # 表现就是"改了颜色不生效，要全部关了重开才出来"。
-            light = {dev: {"mode": getattr(c, "mode_key", "static"),
-                           "color": getattr(c, "color", DEFAULT_COLOR),
-                           "speed": getattr(c, "speed_key", "normal")}}
+        # 必须按设备名嵌套：Backend._apply 用 light.get(name) 取本设备的灯效，
+        # 传扁平字典会返回 None → 颜色/模式/速度被静默丢掉退回默认，
+        # 表现就是"改了颜色不生效，要全部关了重开才出来"。
+        light = {dev: c.light_cfg()} if (c is not None and on) else None
 
         def rollback():
             st = self.state.get(dev, {"on": True, "level": "high"})
@@ -1776,17 +1777,11 @@ class App(tk.Tk):
         self._run_async(lambda: self.backend.set_device(dev, on, lvl_num, light),
                         ok, fail, rollback)
 
-    def _dev_label(self, dev):
-        return _dev_label(dev)
-
     def _all(self, on):
         lvl = 3 if on else 0
         level_key = "high" if on else "off"
         # 逐设备带上各自卡片的灯效，避免批量操作把灯效重置成默认
-        lights = {d: {"mode": getattr(self.cards[d], "mode_key", "static"),
-                      "color": getattr(self.cards[d], "color", DEFAULT_COLOR),
-                      "speed": getattr(self.cards[d], "speed_key", "normal")}
-                  for d in DEVICES}
+        lights = {d: self.cards[d].light_cfg() for d in DEVICES}
 
         def rollback(names=None):
             # 部分失败只回滚失败的设备，成功的保持新状态
