@@ -38,6 +38,8 @@ lightctl 取了 g-helper 的协议精华（按 PID 路由 + 按位 power），�
 
 - **按 USB Product ID 路由**：后盖只写 `0x18c6` 的 hidraw，键盘只写 `0x1a30`，从根上杜绝误伤（z13ctl 是全广播靠 zone 字节碰运气）
 - **按位 power 控制**：`[0x5D,0xBD,0x01,keyb,bar,lid,rear,0xFF]`，关后盖 = `bar/lid/rear` 清 0、`keyb` 保持 `0xFF`，键盘完全不受影响
+- **灯效可调且会存**：每张卡片三种设色入口共用一条路径 —— 「取色」按钮（Tk 自带 `colorchooser`）、
+  8 个预设色块、hex 输入框。模式/颜色/速度会写进 `state.json`（schema 3），重启后自动恢复并重放到硬件
 - **Aura HID 直写**：64 字节输出报告（Report ID `0x5d`），直接写 `/dev/hidrawN`，不需要 z13ctl 二进制、不需要 .NET、不需要 root（靠 udev 规则）
 - **协议逆向自** [g-helper](https://github.com/seerge/g-helper)（MIT）和 [z13ctl PROTOCOL.md](https://github.com/dahui/z13ctl)
 - **开灯序列**：与 z13ctl `Apply()` 一致 —— 每个物理设备发**两个 zone** 的 SetMode+Commit（12 包）。只发自己 zone 的 9 包实测会让灯保持全关（2026-10-03 实测）。包序（亮度放前还是放后）实测**无影响**（2026-10-04 对照实验）

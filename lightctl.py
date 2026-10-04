@@ -30,7 +30,7 @@ import time
 import tkinter as tk
 from tkinter import ttk, messagebox
 
-STATE_SCHEMA = 2
+STATE_SCHEMA = 3
 errno_EACCES = _errno.EACCES
 errno_EPERM = _errno.EPERM
 
@@ -70,6 +70,15 @@ MODE_LIST = list(MODES)
 SPEEDS = {"slow": 0xE1, "normal": 0xEB, "fast": 0xF5}
 SPEED_LIST = list(SPEEDS)
 
+# 默认颜色给显式白色。(0,0,0) 表示 Aura 的"设备自选色"(rand=0xFF)，
+# 但 2026-10-04 实测：rand=0xFF 时本机键盘区一直全黑，所以不用它当默认。
+DEFAULT_COLOR = (255, 255, 255)
+# 预设色块，点一下就设成该颜色
+COLOR_PRESETS = [
+    (255, 255, 255), (255, 200, 120), (255, 60, 60), (255, 0, 160),
+    (160, 0, 255), (40, 90, 255), (0, 200, 255), (0, 220, 120),
+]
+
 # 主题配色
 THEMES = {
     "dark": {
@@ -103,7 +112,7 @@ _STRINGS = {
         "mode_static": "常亮", "mode_breathe": "呼吸",
         "mode_cycle": "循环", "mode_rainbow": "彩虹", "mode_strobe": "频闪",
         "speed": "速度", "speed_slow": "慢", "speed_normal": "中", "speed_fast": "快",
-        "auto_color": "自动",
+        "auto_color": "自动", "pick_color": "取色",
         "on": "开", "off": "关",
         "low": "低", "medium": "中", "high": "高",
         "all_on": "全部打开", "all_off": "全部关闭",
@@ -151,7 +160,7 @@ _STRINGS = {
         "mode_static": "Static", "mode_breathe": "Breathe",
         "mode_cycle": "Cycle", "mode_rainbow": "Rainbow", "mode_strobe": "Strobe",
         "speed": "Speed", "speed_slow": "Slow", "speed_normal": "Normal", "speed_fast": "Fast",
-        "auto_color": "Auto",
+        "auto_color": "Auto", "pick_color": "Pick",
         "on": "On", "off": "Off",
         "low": "Low", "medium": "Medium", "high": "High",
         "all_on": "All on", "all_off": "All off",
@@ -268,9 +277,18 @@ def save_settings(s):
     _write_json(SETTINGS_FILE, s)
 
 
+def _clean_color(c):
+    """[r,g,b] → (r,g,b)；非法返回 None。"""
+    if (isinstance(c, (list, tuple)) and len(c) == 3
+            and all(isinstance(x, int) and not isinstance(x, bool)
+                    and 0 <= x <= 255 for x in c)):
+        return tuple(int(x) for x in c)
+    return None
+
+
 def load_state():
     """读状态并清洗：带 schema 版本、丢弃旧版遗留键（如 lightbar）、
-    把每个设备项校验成 {on: bool, level: str}，坏值回落默认。"""
+    把每个设备项校验成 {on, level, mode, speed, color}，坏值回落默认。"""
     raw = _read_json(STATE_FILE, {})
     out = {"schema": STATE_SCHEMA}
     for d in DEVICES:
@@ -279,9 +297,14 @@ def load_state():
             v = {}
         on = v.get("on")
         level = v.get("level")
+        mode = v.get("mode")
+        speed = v.get("speed")
         out[d] = {
             "on": on if isinstance(on, bool) else True,
             "level": level if level in LEVELS else "high",
+            "mode": mode if mode in MODES else "static",
+            "speed": speed if speed in SPEEDS else "normal",
+            "color": _clean_color(v.get("color")) or DEFAULT_COLOR,
         }
     return out
 
@@ -857,7 +880,7 @@ class Card:
                                   self._speed, width=5)
         self.speed_combo.pack(side="right")
 
-        # 颜色：hex 输入 + 色块预览
+        # 颜色：hex 输入 + 取色器 + 色块预览
         r5 = tk.Frame(self.frame, bg=th["CARD_BG"]); r5.pack(fill="x", pady=(8, 0))
         _lbl(r5, t("color"), th["CARD_BG"], th["FG_DIM"]).pack(side="left")
         self.color_var = tk.StringVar(value=self._color_str())
@@ -871,6 +894,23 @@ class Card:
         self.color_sw = tk.Label(r5, text="  ", width=3,
                                  bg=th["ENTRY_BG"], relief="solid", bd=1)
         self.color_sw.pack(side="right", padx=(0, 6))
+        self.pick_btn = tk.Button(r5, text=t("pick_color"),
+                                  command=self._pick_color,
+                                  bg=th["BTN_BG"], fg=th["FG"], relief="flat",
+                                  padx=6, pady=0)
+        self.pick_btn.pack(side="right", padx=(0, 6))
+
+        # 预设色：点一下直接设色
+        r6 = tk.Frame(self.frame, bg=th["CARD_BG"])
+        r6.pack(fill="x", pady=(4, 0))
+        self.preset_btns = []
+        for rgb in COLOR_PRESETS:
+            hexcol = "#%02x%02x%02x" % rgb
+            b = tk.Button(r6, text="", width=2, relief="solid", bd=1,
+                          bg=hexcol, activebackground=hexcol,
+                          command=lambda c=rgb: self._preset(c))
+            b.pack(side="left", padx=1)
+            self.preset_btns.append((b, rgb))
 
         self.path_lbl = _lbl(self.frame, "", th["CARD_BG"], th["FG_DIM"],
                              font=("Mono", 8))
@@ -926,9 +966,50 @@ class Card:
             if hasattr(self.on_change, "__self__"):
                 self.on_change.__self__.log_lbl.config(text=t("color_bad"))
             return
+        self._set_color(rgb)
+
+    def _pick_color(self):
+        """系统取色器（Tk 自带 colorchooser，无额外依赖）。"""
+        try:
+            from tkinter import colorchooser
+        except ImportError:
+            return
+        try:
+            rgb, _hx = colorchooser.askcolor(
+                color="#%02x%02x%02x" % self.color, title=t("pick_color"),
+                parent=self.frame.winfo_toplevel())
+        except tk.TclError:
+            return
+        if rgb:
+            self._set_color(tuple(int(x) for x in rgb))
+
+    def _preset(self, rgb):
+        """点预设色块。"""
+        self._set_color(rgb)
+
+    def _set_color(self, rgb):
+        """设色的唯一入口：存值 → 刷输入框与预览 → 通知 App 下发。"""
         self.color = rgb
+        self.color_var.set(self._color_str())
         self._sync_sw()
         self.on_change(self.dev, "light", None)
+
+    def set_light(self, mode, color, speed):
+        """启动时恢复保存的模式/颜色/速度（不触发下发，由 _restore_hw 统一重放）。"""
+        if mode in MODES:
+            self.mode_key = mode
+            if hasattr(self, "mode_var"):
+                self.mode_var.set(t("mode_" + mode))
+        if speed in SPEEDS:
+            self.speed_key = speed
+            if hasattr(self, "speed_var"):
+                self.speed_var.set(t("speed_" + speed))
+        c = _clean_color(color)
+        if c is not None:
+            self.color = c
+        if hasattr(self, "color_var"):
+            self.color_var.set(self._color_str())
+            self._sync_sw()
 
     def _color_str(self):
         if self.color == (0, 0, 0):
@@ -969,6 +1050,8 @@ class Card:
         self.lv.config(values=[t(x) for x in LEVELS])
         for code, b in self.btns.items():
             b.config(text=t(code))
+        if hasattr(self, "pick_btn"):
+            self.pick_btn.config(text=t("pick_color"))
         if hasattr(self, "mode_combo"):
             self.mode_combo.config(values=[t("mode_" + m) for m in MODE_LIST])
             self.speed_combo.config(values=[t("speed_" + s) for s in SPEED_LIST])
@@ -978,7 +1061,10 @@ class Card:
         """热改卡片配色（LabelFrame 及子控件均可 config），不重建。"""
         th = theme()
         self.frame.config(bg=th["CARD_BG"], fg=th["FG"])
+        presets = {id(b) for b, _ in getattr(self, "preset_btns", [])}
         for w in self._walk(self.frame):
+            if id(w) in presets:
+                continue          # 预设色块要保持本色，不跟主题走
             cls = w.winfo_class()
             try:
                 if cls == "Frame":
@@ -1421,7 +1507,9 @@ class App(tk.Tk):
             self.after(150, lambda: self._on_fw_backlight(lv, raw))
             return
         on = lv != "off"
-        self.state["keyboard"] = {"on": on, "level": lv}
+        st = self._remember_light("keyboard")
+        st["on"] = on
+        st["level"] = lv
         save_state(self.state)
         self.cards["keyboard"].set_state(on, lv)
         self.log_lbl.config(
@@ -1517,6 +1605,10 @@ class App(tk.Tk):
     def _restore_ui(self):
         for d in DEVICES:
             st = self.state[d]
+            # 先恢复灯效（模式/颜色/速度），再恢复开关 —— set_state 会按前者刷控件
+            self.cards[d].set_light(st.get("mode", "static"),
+                                    st.get("color", DEFAULT_COLOR),
+                                    st.get("speed", "normal"))
             self.cards[d].set_state(st.get("on", True), st.get("level", "high"))
 
     def _restore_hw(self):
@@ -1567,6 +1659,19 @@ class App(tk.Tk):
             self.cards[d].set_path(nodes.get(d))
         self._sync_tray_icon()
 
+    def _remember_light(self, dev):
+        """把卡片上的模式/颜色/速度写进 state，并返回该设备的状态字典。
+
+        改 on/level 一律走这里 —— 直接整体赋值会把灯效键覆盖掉。
+        """
+        st = self.state.setdefault(dev, {})
+        c = self.cards.get(dev)
+        if c is not None:
+            st["mode"] = c.mode_key
+            st["speed"] = c.speed_key
+            st["color"] = list(c.color)
+        return st
+
     def _on_change(self, dev, kind, value):
         if kind == "toggle":
             if value:
@@ -1582,8 +1687,9 @@ class App(tk.Tk):
             else:
                 self._exec(dev, True, value)
         elif kind == "light":
-            # 模式/颜色/速度改动：仅当灯已开时重下发
-            st = self.state.get(dev, {"on": True})
+            # 模式/颜色/速度改动：先落盘（关着灯也要记住），灯开着立刻重下发
+            st = self._remember_light(dev)
+            save_state(self.state)
             if st.get("on", True):
                 lv = self.cards[dev].lv_key
                 self._exec(dev, True, lv if lv != "off" else "high")
@@ -1644,7 +1750,7 @@ class App(tk.Tk):
         light = None
         if c is not None and on:
             light = {"mode": getattr(c, "mode_key", "static"),
-                     "color": getattr(c, "color", (0, 0, 0)),
+                     "color": getattr(c, "color", DEFAULT_COLOR),
                      "speed": getattr(c, "speed_key", "normal")}
 
         def rollback():
@@ -1652,7 +1758,9 @@ class App(tk.Tk):
             self.cards[dev].set_state(st.get("on", True), st.get("level", "high"))
 
         def ok(msg):
-            self.state[dev] = {"on": on, "level": level}
+            st = self._remember_light(dev)
+            st["on"] = on
+            st["level"] = level
             save_state(self.state)
             self.cards[dev].set_state(on, level)
             self.log_lbl.config(
@@ -1674,7 +1782,7 @@ class App(tk.Tk):
         level_key = "high" if on else "off"
         # 逐设备带上各自卡片的灯效，避免批量操作把灯效重置成默认
         lights = {d: {"mode": getattr(self.cards[d], "mode_key", "static"),
-                      "color": getattr(self.cards[d], "color", (0, 0, 0)),
+                      "color": getattr(self.cards[d], "color", DEFAULT_COLOR),
                       "speed": getattr(self.cards[d], "speed_key", "normal")}
                   for d in DEVICES}
 
@@ -1686,7 +1794,9 @@ class App(tk.Tk):
 
         def ok(msg):
             for d in DEVICES:
-                self.state[d] = {"on": on, "level": level_key}
+                st = self._remember_light(d)
+                st["on"] = on
+                st["level"] = level_key
                 self.cards[d].set_state(on, level_key)
             save_state(self.state)
             self.log_lbl.config(text=msg)
@@ -1697,7 +1807,9 @@ class App(tk.Tk):
                 # 部分成功：(ok_names, errs)，成功设备落状态，失败设备回滚
                 ok_names, errs = msg[0], msg[1]
                 for d in ok_names:
-                    self.state[d] = {"on": on, "level": level_key}
+                    st = self._remember_light(d)
+                    st["on"] = on
+                    st["level"] = level_key
                     self.cards[d].set_state(on, level_key)
                 save_state(self.state)
                 rollback([d for d in DEVICES if d not in ok_names])
