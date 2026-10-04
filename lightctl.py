@@ -1356,6 +1356,10 @@ class App(tk.Tk):
         self._restore_ui()
         self._refresh_status()
 
+        # 启动时按保存的状态真下发一次。卡片是从 state.json 恢复的，
+        # 而 Aura 写入不更新内核 LED 节点，不重放就会出现"卡片写着开、灯是灭的"。
+        self.after(300, self._restore_hw)
+
         # 托盘
         self.tray = Tray(self)
         if self.settings.get("tray", True):
@@ -1506,6 +1510,38 @@ class App(tk.Tk):
         for d in DEVICES:
             st = self.state[d]
             self.cards[d].set_state(st.get("on", True), st.get("level", "high"))
+
+    def _restore_hw(self):
+        """按保存的状态往硬件重放一次（启动时用）。
+
+        卡片是从 state.json 恢复的，而 Aura 写入不会更新内核 LED 节点，
+        不重放就会出现"卡片写着开、灯却是灭的"。
+        两个设备放在同一次后台调用里，避免撞 _busy。
+        """
+        lv_num = {"off": 0, "low": 1, "medium": 2, "high": 3}
+        plan = {}
+        lights = {}
+        for d in DEVICES:
+            st = self.state.get(d, {})
+            on = bool(st.get("on", True))
+            plan[d] = (on, lv_num.get(st.get("level", "high"), 3) if on else 0)
+            c = self.cards[d]
+            lights[d] = {"mode": c.mode_key, "color": c.color,
+                         "speed": c.speed_key}
+
+        def call():
+            errs = []
+            for d in DEVICES:
+                on, lvl = plan[d]
+                ok, msg = self.backend.set_device(d, on, lvl, lights[d])
+                if not ok:
+                    errs.append(msg)
+            return (not errs), ("; ".join(errs) if errs else "")
+
+        self._run_async(call, lambda m: None,
+                        lambda m: self.log_lbl.config(text=t("fail", m=m))
+                        if m else None,
+                        lambda: None)
 
     def _refresh_status(self):
         nodes = self.backend.refresh()
