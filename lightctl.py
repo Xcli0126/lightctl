@@ -1168,61 +1168,67 @@ class SettingsDialog(tk.Toplevel):
 
 class _SingleInstance:
     """单实例锁：abstract unix socket（Linux 特有，无文件残留）。
-    第二个实例 connect 成功说明已有实例在跑，ok=False。"""
+
+    第二个实例 connect 成功后发一句 show 就退出，由已有实例把窗口抬到前台 ——
+    重复点图标等于"把已有窗口叫出来"，而不是什么都不发生。
+    """
+    SOCK = chr(0) + "lightctl-single-instance"   # abstract namespace
+
     def __init__(self):
         self.ok = True
         self._srv = None
+        self.on_show = None      # 由 App 赋值为可调用对象
         try:
             import socket
-            path = "\0lightctl-single-instance"   # abstract namespace
             s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             try:
-                s.connect(path)
+                s.connect(self.SOCK)
+                try:
+                    s.sendall(b"show")
+                except OSError:
+                    pass
                 s.close()
-                self.ok = False   # 已有实例
+                self.ok = False   # 已有实例，已请求它抬窗口
                 return
             except OSError:
                 pass   # 没有实例，继续绑定
             s.close()
             self._srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            self._srv.bind(path)
-            self._srv.listen(1)
+            self._srv.bind(self.SOCK)
+            self._srv.listen(4)
             self._srv.setblocking(False)
         except Exception:
-            pass   # 绑定失败不阻塞启动
+            self._srv = None
+            return
+        threading.Thread(target=self._serve, daemon=True).start()
 
-    def close(self):
-        if self._srv:
+    def _serve(self):
+        """等第二个实例的 show 请求；收到就回调（App 会在主线程抬窗口）。"""
+        while True:
             try:
-                self._srv.close()
-            except Exception:
-                pass
-
-
-class _SingleInstance:
-    """单实例锁：abstract unix socket（Linux 特有，无文件残留）。
-    第二个实例 connect 成功说明已有实例在跑，ok=False。"""
-    def __init__(self):
-        self.ok = True
-        self._srv = None
-        try:
-            import socket
-            path = "\0lightctl-single-instance"   # abstract namespace
-            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            try:
-                s.connect(path)
-                s.close()
-                self.ok = False   # 已有实例
-                return
+                conn, _ = self._srv.accept()
+            except BlockingIOError:
+                time.sleep(0.25)
+                continue
             except OSError:
-                pass   # 没有实例，继续绑定
-            s.close()
-            self._srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            self._srv.bind(path)
-            self._srv.listen(1)
-            self._srv.setblocking(False)
-        except Exception:
-            pass   # 绑定失败不阻塞启动
+                return          # socket 已关闭，收工
+            try:
+                conn.settimeout(0.5)
+                try:
+                    conn.recv(16)
+                except OSError:
+                    pass
+            finally:
+                try:
+                    conn.close()
+                except OSError:
+                    pass
+            cb = self.on_show
+            if cb:
+                try:
+                    cb()
+                except Exception:
+                    pass
 
     def close(self):
         if self._srv:
@@ -1312,9 +1318,12 @@ class App(tk.Tk):
         # 用 abstract unix socket，第二个实例检测到就激活第一个并退出。
         self._single = _SingleInstance()
         if not self._single.ok:
+            # 第二个实例：_SingleInstance 已经请求过"把窗口叫出来"，这里直接退出
             self._primary_exists = True
             return
         self._primary_exists = False
+        # 收到第二个实例的 show 请求 → 回到主线程抬窗口
+        self._single.on_show = lambda: self.after(0, self.show_window)
         self.settings = load_settings()
         set_lang(self.settings.get("lang", "zh"))
         set_theme(self.settings.get("theme", "dark"))
@@ -1385,7 +1394,12 @@ class App(tk.Tk):
                 applied = val
                 # 回主线程：0=off 1=low 2=medium 3=high
                 lv = {0: "off", 1: "low", 2: "medium"}.get(val, "high")
-                self.after(0, self._on_fw_backlight, lv, val)
+                try:
+                    self.after(0, self._on_fw_backlight, lv, val)
+                except Exception as e:
+                    # 别让监听线程静默死掉：写 stderr，systemd 会收进 journal
+                    sys.stderr.write(
+                        "lightctl: fw backlight dispatch failed: %r\n" % (e,))
             self._fw_stop.wait(0.3)
 
     def _on_fw_backlight(self, lv, raw):
