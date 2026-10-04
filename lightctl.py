@@ -33,9 +33,11 @@ from tkinter import ttk, messagebox
 STATE_SCHEMA = 3
 errno_EACCES = _errno.EACCES
 errno_EPERM = _errno.EPERM
+errno_ENODEV = _errno.ENODEV
+errno_ENOENT = _errno.ENOENT
 
 APP_NAME = "lightctl"
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.4.0"
 CONFIG_DIR = os.path.expanduser("~/.config/lightctl")
 STATE_FILE = os.path.join(CONFIG_DIR, "state.json")
 SETTINGS_FILE = os.path.join(CONFIG_DIR, "settings.json")
@@ -140,6 +142,8 @@ _STRINGS = {
         "tray_on": "灯光已开", "tray_off": "灯光已关",
         "tray_partial": "部分灯光已关",
         "err_no_dev": "未找到 Aura 设备，请检查 udev 规则。",
+        "err_busy": "硬件无响应（上一次写入卡住了），请重启 lightctl",
+        "err_gone": "设备已断开，点「刷新状态」重新扫描",
         "version": "版本",
         "rear_zone": "后盖灯", "kbd_zone": "键盘灯",
         "state_on": "开", "state_off": "关",
@@ -188,6 +192,8 @@ _STRINGS = {
         "tray_on": "Lights on", "tray_off": "Lights off",
         "tray_partial": "Some lights off",
         "err_no_dev": "No Aura device found. Check udev rules.",
+        "err_busy": "Hardware not responding (a previous write is stuck); restart lightctl",
+        "err_gone": "Device disconnected; press Refresh to rescan",
         "version": "Version",
         "rear_zone": "Rear", "kbd_zone": "Keyboard",
         "state_on": "On", "state_off": "Off",
@@ -247,6 +253,8 @@ def _read_json(path, default):
             v = json.load(f)
             if isinstance(v, dict):
                 return v
+    except FileNotFoundError:
+        pass          # 首次运行本来就没有这个文件，不是错误
     except Exception as e:
         sys.stderr.write(f"lightctl: read {path}: {e}\n")
     return default
@@ -287,8 +295,16 @@ def _clean_color(c):
 
 
 def load_state():
-    """读状态并清洗：带 schema 版本、丢弃旧版遗留键（如 lightbar）、
-    把每个设备项校验成 {on, level, mode, speed, color}，坏值回落默认。"""
+    """读状态并清洗，返回 (state, first_run)。
+
+    清洗内容：丢弃旧版遗留键（如 lightbar）、把每个设备项校验成
+    {on, level, mode, speed, color}，坏值回落默认。
+
+    首次运行（还没有 state.json）默认全关：这个工具是给"想关灯/调暗"的人用的，
+    默认全开会让第一次启动就把两台设备点亮（实测过）。first_run 同时告诉调用方
+    别去动硬件 —— 用户还没做过任何选择，不该替他决定。
+    """
+    first_run = not os.path.exists(STATE_FILE)
     raw = _read_json(STATE_FILE, {})
     out = {"schema": STATE_SCHEMA}
     for d in DEVICES:
@@ -300,13 +316,14 @@ def load_state():
         mode = v.get("mode")
         speed = v.get("speed")
         out[d] = {
-            "on": on if isinstance(on, bool) else True,
-            "level": level if level in LEVELS else "high",
+            "on": on if isinstance(on, bool) else not first_run,
+            "level": (level if level in LEVELS
+                      else ("off" if first_run else "high")),
             "mode": mode if mode in MODES else "static",
             "speed": speed if speed in SPEEDS else "normal",
             "color": _clean_color(v.get("color")) or DEFAULT_COLOR,
         }
-    return out
+    return out, first_run
 
 
 def save_state(s):
@@ -503,67 +520,105 @@ class Backend:
             self.nodes, self.denied = find_aura_nodes()
         return self.nodes
 
-    def no_dev_msg(self):
-        """一个节点都没有时，区分"权限不足"与"设备不存在"。
+    def no_dev_msg(self, names=None):
+        """没有可用节点时，区分"权限不足"与"设备不存在"。
 
-        直接用构造/refresh() 时缓存下来的 nodes 与 denied —— 这里再扫一遍
-        hidraw 是白费功夫（每扫一次都要 open + ioctl 所有 0B05 节点）。
+        用构造/refresh() 时缓存下来的 nodes 与 denied —— 这里再扫一遍 hidraw
+        是白费功夫（每扫一次都要 open + ioctl 所有 0B05 节点）。
+
+        names 限定"这次要操作却没成功的设备"：两路只缺一路时，笼统说
+        "未找到 Aura 设备，请检查 udev 规则"会把权限问题指错方向。
         """
-        if self.nodes:
-            return t("err_no_dev")
-        for path, errno in self.denied.values():
+        for name in (names or DEVICES):
+            path, errno = self.denied.get(name, (None, None))
             if errno in (errno_EACCES, errno_EPERM):
-                return t("err_perm", p=path)
+                return t("err_perm", p=path or "")
         return t("err_no_dev")
 
     def _apply(self, names, on, level, light=None):
         """取锁→遍历→turn→收集结果。
-        light: dict(name -> {mode/color/speed/color2})，逐设备取自己的灯效，仅 on=True 时用。
-        返回 (ok_names, errs)；errs 元素为 (name, reason)：
-        reason == "missing" 表示设备不在（文案在调用方拼），其余是 OSError 文本。
+
+        light: dict(name -> {mode/color/speed})，逐设备取自己的灯效，仅 on=True 时用。
+        返回 (ok_names, errs)；errs 元素为 (name, reason)，reason 是 token
+        （missing / busy / perm / gone）或 OSError 原文，文案在 _err_text 里拼。
+
+        卡死的写入会一直占着锁，所以用超时取锁而不是无限等，并给出能自助恢复的
+        原因 —— 否则用户只会看到每次操作都"失败：timeout"，不知道怎么办。
         """
         light = light or {}
+        if not self._lock.acquire(timeout=3):
+            return [], [(n, "busy") for n in names]
+        try:
+            ok_names, errs = self._sweep(names, on, level, light)
+        finally:
+            self._lock.release()
+        # 磁吸键盘重插后 hidraw 号会变。设备刚消失时重扫一次再试一遍，
+        # 免得用户只看到裸 errno、还得自己想到去点"刷新状态"。
+        if errs and not ok_names and any(r == "gone" for _, r in errs):
+            self.refresh()
+            if not self._lock.acquire(timeout=3):
+                return [], [(n, "busy") for n in names]
+            try:
+                ok_names, errs = self._sweep(names, on, level, light)
+            finally:
+                self._lock.release()
+        return ok_names, errs
+
+    def _sweep(self, names, on, level, light):
+        """已持锁：逐个设备下发，收集 (ok_names, errs)。"""
         errs, ok_names = [], []
-        with self._lock:
-            for name in names:
-                if name not in self.nodes:
-                    errs.append((name, "missing"))
-                    continue
-                dev = AuraDevice(self.nodes[name])
-                cfg = light.get(name) or {}
-                try:
-                    if on:
-                        color = cfg.get("color", (0, 0, 0))
-                        if name == "keyboard" and color == (0, 0, 0):
-                            # 键盘区给"设备自选色"(rand=0xFF) 实测会一直全黑
-                            # （2026-10-04 对照实验），退回白色 —— 键盘本来就是
-                            # 单色背光，auto 在这里没有意义。
-                            color = (255, 255, 255)
-                        dev.turn_on(
-                            level,
-                            mode=cfg.get("mode", "static"),
-                            color=color,
-                            speed=cfg.get("speed", "normal"),
-                            color2=cfg.get("color2", (0, 0, 0)))
-                    else:
-                        dev.turn_off()
-                    ok_names.append(name)
-                except OSError as e:
-                    errs.append((name, str(e)))
+        for name in names:
+            if name not in self.nodes:
+                errs.append((name, "missing"))
+                continue
+            dev = AuraDevice(self.nodes[name])
+            cfg = light.get(name) or {}
+            color = cfg.get("color", (0, 0, 0))
+            if name == "keyboard" and color == (0, 0, 0):
+                # 键盘区给"设备自选色"(rand=0xFF) 实测会一直全黑
+                # （2026-10-04 对照实验），退回白色 —— 键盘本来就是单色背光。
+                color = (255, 255, 255)
+            try:
+                if on:
+                    dev.turn_on(level, mode=cfg.get("mode", "static"),
+                                color=color,
+                                speed=cfg.get("speed", "normal"))
+                else:
+                    dev.turn_off()
+                ok_names.append(name)
+            except OSError as e:
+                errs.append((name, self._errno_token(e)))
         return ok_names, errs
 
     @staticmethod
-    def _err_text(errs):
-        """(name, reason) 列表 → 显示文案；missing 设备用"未找到"统一说法。"""
-        return "; ".join(
-            t("err_no_dev") if r == "missing" else f"{_dev_label(n)}: {r}"
-            for n, r in errs)
+    def _errno_token(e):
+        """OSError → 给用户看得懂的 token（perm / gone），其余保留原文。"""
+        if e.errno in (errno_EACCES, errno_EPERM):
+            return "perm"
+        if e.errno in (errno_ENODEV, errno_ENOENT):
+            return "gone"
+        return str(e)
+
+    def _err_text(self, errs):
+        """(name, reason) 列表 → 显示文案。reason 是 token 或 OSError 原文。"""
+        def one(n, r):
+            if r == "missing":
+                return f"{_dev_label(n)}: {t('err_no_dev')}"
+            if r == "busy":
+                return t("err_busy")
+            if r == "gone":
+                return f"{_dev_label(n)}: {t('err_gone')}"
+            if r == "perm":
+                path = (self.denied.get(n) or (self.nodes.get(n, ""),))[0]
+                return t("err_perm", p=path)
+            return f"{_dev_label(n)}: {r}"
+        return "; ".join(one(n, r) for n, r in errs)
 
     def set_device(self, name, on, level=3, light=None):
         ok_names, errs = self._apply([name], on, level, light)
         if not ok_names:
             if all(r == "missing" for _, r in errs):
-                return False, self.no_dev_msg()
+                return False, self.no_dev_msg([n for n, _ in errs])
             return False, self._err_text(errs)
         return True, f"{_dev_label(name)} → {t('state_on' if on else 'state_off')}"
 
@@ -573,7 +628,7 @@ class Backend:
             return True, t("all_on_msg") if on else t("all_off_msg")
         if not ok_names:
             if all(r == "missing" for _, r in errs):
-                return False, self.no_dev_msg()
+                return False, self.no_dev_msg([n for n, _ in errs])
             return False, self._err_text(errs)
         # 部分成功：成功名单一等结果，调用方据此只回滚失败的设备
         return (ok_names, errs), (t("partial_msg", m=self._err_text(errs))
@@ -710,7 +765,8 @@ class Tray:
             menu.show_all()
             ind.set_menu(menu)
             self.ind = ind
-            self._update_icon(self._state)
+            # 用真实状态，别用 _state 的初值 —— 否则全关时窗口图标红、托盘图标却是绿的
+            self._update_icon(self.app._overall_state())
 
         GLib.idle_add(_build)
         self._thread = threading.Thread(target=Gtk.main, daemon=True)
@@ -726,8 +782,8 @@ class Tray:
         if not self.ind:
             return
         path = _icon_path(state, 48)
-        # 先在主线程刷新标签（内部读 winfo_viewable），再投递图标更新
-        self._refresh_labels()
+        # 注意：这里可能跑在 GTK 线程（_build 里就会调进来）。
+        # _refresh_labels 要读 winfo_viewable，必须回主线程，由 _sync_tray_icon 负责。
         def _do():
             if path:
                 self.ind.set_icon_full(path, APP_NAME)
@@ -1454,13 +1510,15 @@ class App(tk.Tk):
         self.configure(bg=th["BG"])
 
         self.backend = Backend()
-        self.state = load_state()
+        self.state, self._first_run = load_state()
         for d in DEVICES:
             self.state.setdefault(d, {"on": True, "level": "high"})
 
         self._set_window_icon()
 
         self._busy = False
+        self._inflight = False       # 是否有硬件写入在飞（退出时要等它）
+        self._async_gen = 0          # _run_async 的代次号：过期 watchdog 靠它失效
         self.cards = {}
         self._themed = []   # (widget, role) 注册表，retheme 遍历
         self._build_ui()
@@ -1471,10 +1529,12 @@ class App(tk.Tk):
         # 而 Aura 写入不更新内核 LED 节点，不重放就会出现"卡片写着开、灯是灭的"。
         self.after(300, self._restore_hw)
 
-        # 托盘
+        # 托盘（可选依赖 PyGObject，缺失自动降级）
         self.tray = Tray(self)
         if self.settings.get("tray", True):
             self.tray.start()
+            # GTK 侧把指示器建好后，回主线程按真实状态刷一次图标与菜单文案
+            self.after(200, self._sync_tray_icon)
 
         # 固件背光同步：Fn+F11 会把 /sys/class/leds/asus::kbd_backlight/brightness
         # 顶上去（实测与 brightness_hw_changed 同步变化）。但本机 hid-asus 没注册
@@ -1531,10 +1591,12 @@ class App(tk.Tk):
         self._sync_tray_icon()
         # 内核那条路在本机是断的（hid-asus 未注册背光监听），
         # 只有 Aura 能真正改亮度；写失败只记日志，不回滚按键结果。
+        # light 必须按设备名嵌套，否则 Backend._apply 取不到本设备的灯效，
+        # 会把用户选的颜色/模式/速度统统重置成默认。
         c = self.cards.get("keyboard")
-        light = {"mode": getattr(c, "mode_key", "static"),
-                 "color": getattr(c, "color", (0, 0, 0)),
-                 "speed": getattr(c, "speed_key", "normal")}
+        light = {"keyboard": {"mode": getattr(c, "mode_key", "static"),
+                              "color": getattr(c, "color", DEFAULT_COLOR),
+                              "speed": getattr(c, "speed_key", "normal")}}
         self._run_async(
             lambda: self.backend.set_device("keyboard", on, raw, light),
             lambda m: None,
@@ -1631,7 +1693,11 @@ class App(tk.Tk):
         卡片是从 state.json 恢复的，而 Aura 写入不会更新内核 LED 节点，
         不重放就会出现"卡片写着开、灯却是灭的"。
         两个设备放在同一次后台调用里，避免撞 _busy。
+
+        首次运行不动硬件：用户还没做过任何选择，不该替他决定开或关。
         """
+        if self._first_run:
+            return
         plan, lights = {}, {}
         for d in DEVICES:
             st = self.state.get(d, {})
@@ -1696,6 +1762,10 @@ class App(tk.Tk):
                 lv = self.cards[dev].lv_var.get()
                 inv = {t(x): x for x in LEVELS}
                 lv = inv.get(lv, "high")
+                if lv == "off":
+                    # 档位停在"关"时打开开关：要给个非 0 亮度，否则会发
+                    # POWER_ON + brightness(0)，灯是黑的而状态写"开"。
+                    lv = "high"
                 self._exec(dev, True, lv)
             else:
                 self._exec(dev, False, "off")
@@ -1728,22 +1798,29 @@ class App(tk.Tk):
 
         # 超时兜底：硬件写入正常 <1s；若 worker 卡死（如 after 抛非 TclError），
         # 8 秒后强制复位 _busy 并报错，避免 GUI 永久"执行中…"。
-        self._async_done = False
+        # 用代次号而不是一个布尔量：watchdog 是定时投递的，8 秒后可能已经属于上一次操作。
+        # 只用一个共享标志位时，下一次操作会把它重置，于是上一次遗留的 watchdog
+        # 会误判成当前这次超时：清掉 _busy、跑错的 rollback，并让下一次真正的 done
+        # 提前退出（回调永不执行，硬件改了而 UI/state 没改）。
+        self._async_gen = getattr(self, "_async_gen", 0) + 1
+        gen = self._async_gen
 
         def _watchdog():
-            if self._async_done:
-                return
-            self._async_done = True
+            if gen != self._async_gen:
+                return                  # 已经不是当前这次操作，丢弃
             self._busy = False
+            self._inflight = False
             try:
                 self.log_lbl.config(text=t("fail", m="timeout"))
                 rollback()
             except tk.TclError:
                 pass
         try:
-            self.after(8000, _watchdog)
+            wd = self.after(8000, _watchdog)
         except tk.TclError:
-            pass
+            wd = None
+
+        self._inflight = True
 
         def worker():
             try:
@@ -1751,11 +1828,19 @@ class App(tk.Tk):
             except Exception as e:   # 兜底：任何异常都必须复位 _busy
                 ok, msg = False, f"{type(e).__name__}: {e}"
             def done():
-                if self._async_done:
-                    return
-                self._async_done = True
+                if gen != self._async_gen:
+                    return              # 上一次操作的回调，丢弃
+                self._async_gen += 1    # 让这次遗留的 watchdog 失效
+                if wd is not None:
+                    try:
+                        self.after_cancel(wd)
+                    except (tk.TclError, ValueError):
+                        pass
                 self._busy = False
-                (on_ok if ok else on_fail)(msg)
+                self._inflight = False
+                # 必须判 ok is True：set_all 部分失败时第一元素是 (ok_names, errs)
+                # 元组，判真会走成功分支把两台设备都标记成成功。
+                (on_ok if ok is True else on_fail)(msg)
             try:
                 self.after(0, done)
             except (tk.TclError, RuntimeError):
@@ -1816,7 +1901,7 @@ class App(tk.Tk):
                 save_state(self.state)
                 rollback([d for d in DEVICES if d not in ok_names])
                 self.log_lbl.config(
-                    text=t("partial_msg", m=Backend._err_text(errs)))
+                    text=t("partial_msg", m=self.backend._err_text(errs)))
                 self._sync_tray_icon()
                 return
             self.log_lbl.config(text=t("fail", m=msg))
@@ -1830,6 +1915,7 @@ class App(tk.Tk):
     def _sync_tray_icon(self):
         st = self._overall_state()
         if getattr(self, "tray", None) and self.tray.ind:
+            self.tray._refresh_labels()   # 主线程：内部要读 winfo_viewable
             self.tray._update_icon(st)
         self._set_window_icon()
 
@@ -1975,6 +2061,38 @@ def selftest():
         bad += 1
     else:
         print("OK   颜色能进 SetMode（light 按设备名嵌套）")
+
+    # 回归：set_all 部分失败时第一元素是 (ok_names, errs) 元组，不是 True。
+    # 调用方（_run_async）必须靠 `ok is True` 区分 —— 曾经直接判真，
+    # 结果失败的设备也被标记成"已打开"，写坏 state.json。
+    saved = dict(b.nodes)
+    b.nodes.pop("keyboard", None)
+    try:
+        res = b.set_all(True, 3)
+    finally:
+        b.nodes.clear()
+        b.nodes.update(saved)
+    first = res[0]
+    if first is True or not isinstance(first, tuple):
+        print("FAIL: set_all 部分失败返回值不能区分成功/失败: %r" % (first,))
+        bad += 1
+    elif first[0] != ["rear"]:
+        print("FAIL: set_all 部分失败的成功名单不对: %r" % (first[0],))
+        bad += 1
+    else:
+        print("OK   set_all 部分失败：成功名单 =", first[0])
+
+    # 回归：写入卡死占着锁时，要给出能自助恢复的提示，而不是无限等
+    b._lock.acquire()
+    try:
+        ok2, msg2 = b.set_device("rear", True, 3)
+    finally:
+        b._lock.release()
+    if ok2 or "无响应" not in msg2:
+        print("FAIL: 锁被占时没给出可恢复提示:", ok2, msg2)
+        bad += 1
+    else:
+        print("OK   锁被占时提示:", msg2)
 
     steps = [
         ("关后盖(键盘不动)", lambda: b.set_device("rear", False)),
