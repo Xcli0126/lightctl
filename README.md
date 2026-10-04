@@ -40,7 +40,21 @@ lightctl 取了 g-helper 的协议精华（按 PID 路由 + 按位 power），�
 - **按位 power 控制**：`[0x5D,0xBD,0x01,keyb,bar,lid,rear,0xFF]`，关后盖 = `bar/lid/rear` 清 0、`keyb` 保持 `0xFF`，键盘完全不受影响
 - **Aura HID 直写**：64 字节输出报告（Report ID `0x5d`），直接写 `/dev/hidrawN`，不需要 z13ctl 二进制、不需要 .NET、不需要 root（靠 udev 规则）
 - **协议逆向自** [g-helper](https://github.com/seerge/g-helper)（MIT）和 [z13ctl PROTOCOL.md](https://github.com/dahui/z13ctl)
-- **开灯序列**：与 z13ctl `Apply()` 一致 —— 每个物理设备发**两个 zone** 的 SetMode+Commit（12 包）。只发自己 zone 的 9 包实测会让灯保持全关（2026-10-03 实测）
+- **开灯序列**：与 z13ctl `Apply()` 一致 —— 每个物理设备发**两个 zone** 的 SetMode+Commit（12 包）。只发自己 zone 的 9 包实测会让灯保持全关（2026-10-03 实测）。包序（亮度放前还是放后）实测**无影响**（2026-10-04 对照实验）
+
+### 本机（GZ302EA）实测的两个坑
+
+1. **颜色不能用 `auto`（Aura `rand=0xFF`，"设备自选色"）**：键盘区会一直全黑、毫无反应。
+   2026-10-04 三变体对照：唯一变量换成显式颜色就亮。因此默认颜色是显式白色，
+   且键盘设备即使收到 `auto` 也会退回白色（后盖灯条仍保留 `auto` 语义）。
+2. **内核的键盘背光通道是死的**：本机 `hid-asus` 读回的 `kbd_func` 里背光位为 0，
+   于是它不注册背光监听；结果是
+   - 写 `/sys/class/leds/asus::kbd_backlight/brightness`（含 root）**改不了物理灯**；
+   - Fn+F11 会更新该节点与 `brightness_hw_changed`（OSD 条因此正常动），但**物理亮度不动**。
+
+   所以 lightctl 的做法是：**轮询该亮度节点，读到变化就用 Aura 通道把同档亮度真正打下去**。
+   这也是为什么 Fn+F11 能在这里工作 —— 靠的是 Aura，不是内核那条路。
+   `brightness_hw_changed` 与 `brightness` 实测同步变化，轮询前者或后者都行，这里选后者。
 
 ## 安装
 
