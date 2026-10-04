@@ -92,6 +92,25 @@ sed "s|^Exec=.*|Exec=$HOME/.local/bin/lightctl|" lightctl.desktop \
 - **刷新状态**：重新扫描 hidraw 设备（磁吸键盘重插后用）
 - **⚙ 设置**：切换语言、主题、托盘常驻、开机自启
 - 托盘图标：左键点菜单开关两路灯 / 显示主窗口 / 打开设置 / 退出；主窗口关闭时最小化到托盘
+  （托盘依赖缺失时设置页里那一项会置灰，不会给一个点了没反应的勾选框）
+
+## 命令行（一次性下发，不开窗口）
+
+灯光工具的日常用法是"按一下就切"。绑快捷键、合盖/锁屏钩子、无 GUI 会话下都能直接用：
+
+```bash
+lightctl --set rear=off                      # 只关后盖，键盘不动
+lightctl --set keyboard=on --level keyboard=low
+lightctl --level rear=medium --color rear=00dc78 --mode rear=breathe --speed rear=slow
+lightctl --color keyboard=#00c8ff --mode keyboard=static
+```
+
+- 参数一律写 `设备=值`，设备是 `rear` 或 `keyboard`，可重复；值写错立即报错并以退出码 1 退出，
+  不会静默按默认值处理。
+- **有 GUI 在跑时，这些改动会交给 GUI 执行**：GUI 才是 `state.json` 的唯一写入方，
+  让命令行直接改文件会被它下一次写盘整体覆盖掉（实测过）。没 GUI 时命令行自己下发并落盘。
+- `--minimized`：启动后不显示窗口（开机自启用的，自启条目里已经带上它），
+  之后点桌面图标或托盘菜单即可叫出来。
 
 ## 自测
 

@@ -37,7 +37,7 @@ errno_ENODEV = _errno.ENODEV
 errno_ENOENT = _errno.ENOENT
 
 APP_NAME = "lightctl"
-APP_VERSION = "1.5.0"
+APP_VERSION = "1.7.0"
 CONFIG_DIR = os.path.expanduser("~/.config/lightctl")
 STATE_FILE = os.path.join(CONFIG_DIR, "state.json")
 SETTINGS_FILE = os.path.join(CONFIG_DIR, "settings.json")
@@ -132,6 +132,8 @@ _STRINGS = {
         "err_perm": "权限不足：{p}（需要 udev 规则）",
         "color_bad": "颜色格式应为 RRGGBB 或 auto",
         "light_saved": "已记住，开灯时生效",
+        "reloaded": "已按命令行改动刷新",
+        "cli_applied": "已执行命令行改动",
         "tray_hidden": "已隐藏到托盘（托盘菜单里可退出）",
         "tray_na": "需要 PyGObject",
         "settings_title": "设置",
@@ -185,6 +187,8 @@ _STRINGS = {
         "err_perm": "Permission denied: {p} (udev rule required)",
         "color_bad": "Color must be RRGGBB or auto",
         "light_saved": "Saved; applies when switched on",
+        "reloaded": "Reloaded after a command-line change",
+        "cli_applied": "Applied the command-line change",
         "tray_hidden": "Hidden to tray (quit from the tray menu)",
         "tray_na": "requires PyGObject",
         "settings_title": "Settings",
@@ -319,6 +323,23 @@ def save_settings(s):
     return _write_json(SETTINGS_FILE, s)
 
 
+def _parse_color(s):
+    """颜色输入 → (r,g,b)。
+
+    auto / 空 → (0,0,0)（"设备自选色"）；RRGGBB 或 #RRGGBB → (r,g,b)；
+    其它一律返回 None，由调用方决定怎么提示。
+    """
+    s = s.strip().lstrip("#")
+    if not s or s.lower() == "auto":
+        return (0, 0, 0)
+    if len(s) == 6:
+        try:
+            return tuple(int(s[i:i + 2], 16) for i in (0, 2, 4))
+        except ValueError:
+            pass
+    return None
+
+
 def _clean_color(c):
     """[r,g,b] → (r,g,b)；非法返回 None。"""
     if (isinstance(c, (list, tuple)) and len(c) == 3
@@ -379,7 +400,8 @@ def set_autostart(enabled):
             q = lambda s: '"' + s.replace('"', '\\\\"') + '"'
             content = (
                 "[Desktop Entry]\nType=Application\nName=lightctl\n"
-                f"Exec={q(sys.executable)} {q(exe)}\nTerminal=false\n"
+                f"Exec={q(sys.executable)} {q(exe)} --minimized\n"
+                "Terminal=false\n"
                 "X-GNOME-Autostart-enabled=true\nStartupNotify=true\n"
             )
             with open(AUTOSTART_FILE, "w", encoding="utf-8") as f:
@@ -1082,21 +1104,8 @@ class Card:
                                  SPEED_LIST, self.speed_var.get(), "normal")
         self.on_change(self.dev, "light", None)
 
-    @staticmethod
-    def _parse_color(s):
-        # auto/empty -> (0,0,0); RRGGBB or #RRGGBB -> (r,g,b); invalid -> None
-        s = s.strip().lstrip("#")
-        if not s or s.lower() == "auto":
-            return (0, 0, 0)
-        if len(s) == 6:
-            try:
-                return tuple(int(s[i:i + 2], 16) for i in (0, 2, 4))
-            except ValueError:
-                pass
-        return None   # 非法
-
     def _color(self, _e=None):
-        rgb = self._parse_color(self.color_var.get())
+        rgb = _parse_color(self.color_var.get())
         if rgb is None:
             # 非法输入：回滚到上次值，提示写在本卡片的徽章上 ——
             # 写主窗口日志行离得太远，而且会被下一次操作的日志覆盖。
@@ -1420,21 +1429,27 @@ class _SingleInstance:
     """
     SOCK = chr(0) + "lightctl-single-instance"   # abstract namespace
 
-    def __init__(self):
+    def __init__(self, message=b"show"):
+        """message 是发给已有实例的指令：show（抬窗口）或 reload（重读 state）。
+
+        开 GUI 走 show；一次性 CLI 改完灯光走 reload，让卡片跟上。
+        """
         self.ok = True
         self._srv = None
         self.on_show = None      # 由 App 赋值为可调用对象
+        self.on_reload = None
+        self.on_apply = None
         try:
             import socket
             s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             try:
                 s.connect(self.SOCK)
                 try:
-                    s.sendall(b"show")
+                    s.sendall(message)
                 except OSError:
                     pass
                 s.close()
-                self.ok = False   # 已有实例，已请求它抬窗口
+                self.ok = False   # 已有实例，指令已送出
                 return
             except OSError:
                 pass   # 没有实例，继续绑定
@@ -1449,7 +1464,10 @@ class _SingleInstance:
         threading.Thread(target=self._serve, daemon=True).start()
 
     def _serve(self):
-        """等第二个实例的 show 请求；收到就回调（App 会在主线程抬窗口）。"""
+        """等指令：show（抬窗口）/ reload（重读 state）/ apply（一次性 CLI 的改动）。
+
+        收到的都是投递给 App，由它在主线程处理 —— 这里只负责收和转发。
+        """
         while True:
             try:
                 conn, _ = self._srv.accept()
@@ -1458,10 +1476,11 @@ class _SingleInstance:
                 continue
             except OSError:
                 return          # socket 已关闭，收工
+            msg = b""
             try:
                 conn.settimeout(0.5)
                 try:
-                    conn.recv(16)
+                    msg = conn.recv(4096)
                 except OSError:
                     pass
             finally:
@@ -1469,12 +1488,22 @@ class _SingleInstance:
                     conn.close()
                 except OSError:
                     pass
-            cb = self.on_show
-            if cb:
-                try:
-                    cb()
-                except Exception:
-                    pass
+            head, _, payload = msg.partition(bytes([10]))
+            if head == b"apply" and payload:
+                self._dispatch(self.on_apply, payload)
+            elif head == b"reload":
+                self._dispatch(self.on_reload, None)
+            else:
+                self._dispatch(self.on_show, None)
+
+    @staticmethod
+    def _dispatch(cb, arg):
+        if cb is None:
+            return
+        try:
+            cb() if arg is None else cb(arg)
+        except Exception:
+            pass
 
     def close(self):
         if self._srv:
@@ -1556,6 +1585,11 @@ class App(tk.Tk):
         self._single = single
         # 收到第二个实例的 show 请求 → 回到主线程抬窗口
         self._single.on_show = lambda: self.after(0, self.show_window)
+        # 收到一次性 CLI 的 reload 请求 → 重读 state.json 让卡片跟上
+        self._single.on_reload = lambda: self.after(0, self.reload_state)
+        # 一次性 CLI 的改动由 GUI 执行（GUI 是 state.json 的唯一写入方）
+        self._single.on_apply = lambda payload: self.after(
+            0, self.apply_plan, payload)
         self.settings = load_settings()
         set_lang(self.settings.get("lang", "zh"))
         set_theme(self.settings.get("theme", "dark"))
@@ -1675,6 +1709,45 @@ class App(tk.Tk):
                 self.iconphoto(True, self._tkimg)
             except Exception:
                 pass
+
+    def apply_plan(self, payload, _queue=None):
+        """执行一次性 CLI 传来的改动（{设备: {属性: 值}} 的 JSON）。
+
+        有 GUI 在跑时由 GUI 动手：它才是 state.json 的唯一写入方，
+        让 CLI 直接改文件会被 GUI 下一次 save_state 整体覆盖掉（实测过）。
+        逐设备下发，_busy 时重排，避免两次操作撞在一起。
+        """
+        if self._busy:
+            self.after(200, lambda: self.apply_plan(payload, _queue))
+            return
+        if _queue is None:
+            try:
+                plan = json.loads(payload.decode("utf-8"))
+            except (ValueError, UnicodeDecodeError):
+                return
+            _merge_spec(self.state, plan)
+            save_state(self.state)
+            _queue = [d for d in plan if d in self.cards]
+        if not _queue:
+            self._restore_ui()
+            self.log_lbl.config(text=t("cli_applied"))
+            self._sync_tray_icon()
+            return
+        dev = _queue.pop(0)
+        st = self.state.get(dev, {})
+        on = bool(st.get("on", True))
+        self._exec(dev, on, st.get("level", "high") if on else "off")
+        self.after(400, lambda: self.apply_plan(payload, _queue))
+
+    def reload_state(self):
+        """外部（一次性 CLI）改了 state.json 之后重新读一遍，把卡片同步过来。"""
+        if self._busy:
+            self.after(200, self.reload_state)
+            return
+        self.state, _ = load_state()
+        self._restore_ui()
+        self.log_lbl.config(text=t("reloaded"))
+        self._sync_tray_icon()
 
     def _overall_state(self):
         ons = [
@@ -2092,6 +2165,129 @@ class App(tk.Tk):
             self.cards[d].apply_theme()
         self._refresh_status()
 # ---------- 自测 ----------
+def _notify_gui(message):
+    """有 GUI 在跑就通过单实例 socket 递一条指令过去；没在跑返回 False。"""
+    try:
+        import socket
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(1)
+        s.connect(_SingleInstance.SOCK)
+        s.sendall(message)
+        s.close()
+        return True
+    except OSError:
+        return False
+
+
+def _pair(item, flag):
+    """"设备=值" → (设备, 值)；设备名写错立刻报错，不静默忽略。"""
+    dev, sep, val = item.partition("=")
+    dev, val = dev.strip(), val.strip()
+    if not sep or dev not in DEVICES:
+        raise SystemExit("lightctl: --%s 需要 %s=值，收到 %r"
+                         % (flag, "|".join(DEVICES), item))
+    return dev, val
+
+
+def _cli_plan(args):
+    """解析并校验 --set/--level/--mode/--speed/--color，返回规范化后的计划。
+
+    计划形如 {设备: {"on": True, "level": "low", "mode": "static", ...}}，
+    只含用户显式指定的属性。一次性调用没人盯着输出，所以值写错一律报错退出 ——
+    静默按默认值处理比报错更糟（曾经 --set rear=bogus 被当成关灯）。
+    """
+    plan = {}
+
+    def spec(dev):
+        return plan.setdefault(dev, {})
+
+    for item in args.set or []:
+        dev, val = _pair(item, "set")
+        low = val.lower()
+        if low not in ("on", "off", "1", "0", "true", "false", "yes", "no"):
+            raise SystemExit("lightctl: --set 只能是 on/off，收到 %r" % (val,))
+        spec(dev)["on"] = low in ("on", "1", "true", "yes")
+    for item in args.level or []:
+        dev, val = _pair(item, "level")
+        val = val.lower()
+        if val not in LEVELS:
+            raise SystemExit("lightctl: --level 只能是 " + "/".join(LEVELS))
+        spec(dev)["level"] = val
+    for item in args.mode or []:
+        dev, val = _pair(item, "mode")
+        if val not in MODES:
+            raise SystemExit("lightctl: --mode 只能是 " + "/".join(MODE_LIST))
+        spec(dev)["mode"] = val
+    for item in args.speed or []:
+        dev, val = _pair(item, "speed")
+        if val not in SPEEDS:
+            raise SystemExit("lightctl: --speed 只能是 " + "/".join(SPEED_LIST))
+        spec(dev)["speed"] = val
+    for item in args.color or []:
+        dev, val = _pair(item, "color")
+        rgb = _parse_color(val)
+        if rgb is None:
+            raise SystemExit("lightctl: --color 应为 RRGGBB / #RRGGBB / auto")
+        spec(dev)["color"] = list(rgb)
+    return plan
+
+
+def _merge_spec(state, plan):
+    """把计划并进 state（原地修改）。值已在 _cli_plan 里校验过。"""
+    for dev, spec in plan.items():
+        st = state.setdefault(dev, {})
+        st.setdefault("mode", "static")
+        st.setdefault("speed", "normal")
+        st.setdefault("color", list(DEFAULT_COLOR))
+        if "level" in spec:
+            st["level"] = spec["level"]
+            st["on"] = spec["level"] != "off"
+        if "on" in spec:
+            st["on"] = spec["on"]
+            if st["on"] and st.get("level") in (None, "off"):
+                # 别发 brightness(0)：灯是黑的却写"开"
+                st["level"] = "high"
+        for key in ("mode", "speed", "color"):
+            if key in spec:
+                st[key] = spec[key]
+    return state
+
+
+def cli_run(args):
+    """一次性下发灯光（不开窗口）：给快捷键、合盖钩子、无 GUI 会话用。
+
+    返回退出码；返回 None 表示"没有一次性指令"，调用方该去开 GUI。
+    """
+    plan = _cli_plan(args)
+    if not plan:
+        return None
+    # 有 GUI 在跑就交给它执行：GUI 才是 state.json 的唯一写入方。
+    # 让 CLI 直接改文件会被 GUI 下一次 save_state 整体覆盖掉 ——
+    # 实测键盘的 Fn+F11 同步写盘时，把 CLI 刚设好的后盖状态抹了回去。
+    if _notify_gui(b"apply" + bytes([10]) + json.dumps(plan).encode("utf-8")):
+        print("已交给运行中的 lightctl 执行：" +
+              ", ".join(_dev_label(d) for d in plan))
+        return 0
+    backend = Backend()
+    state, _ = load_state()
+    _merge_spec(state, plan)
+    bad = 0
+    for dev in plan:
+        st = state[dev]
+        on = bool(st.get("on", True))
+        brightness = LEVEL_NUM.get(st.get("level", "high"), 3) if on else 0
+        # light 按设备名嵌套（见 Backend._apply 的约定）
+        light = {dev: {"mode": st.get("mode", "static"),
+                       "color": tuple(st.get("color", DEFAULT_COLOR)),
+                       "speed": st.get("speed", "normal")}}
+        ok, msg = backend.set_device(dev, on, brightness, light)
+        print("%-9s %s" % (dev, msg))
+        if not ok:
+            bad += 1
+    save_state(state)
+    return 1 if bad else 0
+
+
 def selftest():
     """不开 GUI 验证链路：找设备 → 关后盖(键盘不动) → 开后盖 → 关键盘 → 全开。"""
     _i18n_check()
@@ -2206,9 +2402,22 @@ def main():
                     help="window geometry (default: centered)")
     ap.add_argument("--open-settings", action="store_true",
                     help="open the settings dialog on start")
+    ap.add_argument("--minimized", action="store_true",
+                    help="start hidden (for the autostart entry)")
+    # 一次性控制：不开窗口，改完就退出。给快捷键、合盖钩子、无 GUI 会话用。
+    for flag, metavar in (("set", "DEV=on|off"),
+                          ("level", "DEV=off|low|medium|high"),
+                          ("mode", "DEV=static|breathe|cycle|rainbow|strobe"),
+                          ("speed", "DEV=slow|normal|fast"),
+                          ("color", "DEV=RRGGBB|auto")):
+        ap.add_argument("--" + flag, action="append", metavar=metavar,
+                        help="one-shot control, no window (repeatable)")
     args = ap.parse_args()
     if args.selftest:
         raise SystemExit(selftest())
+    code = cli_run(args)
+    if code is not None:
+        return code
     # 先抢单实例锁：抢不到就直接退出，不建窗口
     # （第二个实例已经在 _SingleInstance 里请求过"把已有窗口叫出来"）。
     single = _SingleInstance()
@@ -2216,6 +2425,9 @@ def main():
         sys.stderr.write("lightctl: 已有实例在运行，已把它叫到前台。\n")
         return 0
     app = App(single)
+    if args.minimized:
+        # 开机自启最不需要的就是弹窗；点图标或托盘菜单再叫回来
+        app.withdraw()
     try:
         app.update_idletasks()
         if args.geometry:
