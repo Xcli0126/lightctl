@@ -41,7 +41,6 @@ lightctl 取了 g-helper 的协议精华（按 PID 路由 + 按位 power），�
 - **Aura HID 直写**：64 字节输出报告（Report ID `0x5d`），直接写 `/dev/hidrawN`，不需要 z13ctl 二进制、不需要 .NET、不需要 root（靠 udev 规则）
 - **协议逆向自** [g-helper](https://github.com/seerge/g-helper)（MIT）和 [z13ctl PROTOCOL.md](https://github.com/dahui/z13ctl)
 - **开灯序列**：与 z13ctl `Apply()` 一致 —— 每个物理设备发**两个 zone** 的 SetMode+Commit（12 包）。只发自己 zone 的 9 包实测会让灯保持全关（2026-10-03 实测）
-- **开灯序列**：与 z13ctl `Apply()` 一致 —— 每个物理设备发**两个 zone** 的 SetMode+Commit（12 包）。只发自己 zone 的 9 包实测会让灯保持全关（2026-10-03 实测）
 
 ## 安装
 

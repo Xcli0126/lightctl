@@ -1404,7 +1404,14 @@ class App(tk.Tk):
         if self._busy:
             return
         st = self.state.get("keyboard", {})
+        cur_on = bool(st.get("on", False))
         if st.get("level") == lv:
+            return
+        if lv == "off" and cur_on:
+            # 固件读数停在 0（Aura 写入不会动 brightness_hw_changed），
+            # 与 GUI 刚下的开灯冲突 → 视为过期读数，不覆盖 GUI 状态。
+            self.log_lbl.config(
+                text=f"{_dev_label('keyboard')} → {t('state_on')}  (固件读数未变，保持)")
             return
         on = lv != "off"
         self.state["keyboard"] = {"on": on, "level": lv}
