@@ -477,7 +477,6 @@ class AuraDevice:
                 color=(0, 0, 0), speed="normal",
                 color2=(0, 0, 0)):
         """开灯 + 设色/模式。color=(0,0,0) 表示设备自选色。
-        zone 只决定 SetMode 里哪个 zone 用本设备的灯效；
         实测（2026-10-03）每个物理设备必须发两个 zone 的 SetMode+Commit，
         只发自己的 zone 会让灯保持全关。与 z13ctl Apply() 的行为一致。"""
         r, g, b = color
@@ -1633,7 +1632,7 @@ class App(tk.Tk):
             errs = []
             for d in DEVICES:
                 on, lvl = plan[d]
-                ok, msg = self.backend.set_device(d, on, lvl, lights[d])
+                ok, msg = self.backend.set_device(d, on, lvl, lights)
                 if not ok:
                     errs.append(msg)
             return (not errs), ("; ".join(errs) if errs else "")
@@ -1749,9 +1748,12 @@ class App(tk.Tk):
         c = self.cards.get(dev)
         light = None
         if c is not None and on:
-            light = {"mode": getattr(c, "mode_key", "static"),
-                     "color": getattr(c, "color", DEFAULT_COLOR),
-                     "speed": getattr(c, "speed_key", "normal")}
+            # 必须按设备名嵌套！Backend._apply 用 light.get(name) 取本设备的灯效，
+            # 传扁平字典会返回 None → 颜色/模式/速度被静默丢掉退回默认，
+            # 表现就是"改了颜色不生效，要全部关了重开才出来"。
+            light = {dev: {"mode": getattr(c, "mode_key", "static"),
+                           "color": getattr(c, "color", DEFAULT_COLOR),
+                           "speed": getattr(c, "speed_key", "normal")}}
 
         def rollback():
             st = self.state.get(dev, {"on": True, "level": "high"})
@@ -1953,6 +1955,26 @@ def selftest():
         bad += 1
     if bad:
         return 1
+
+    # 回归：set_device 的 light 必须按设备名嵌套。传扁平字典时
+    # Backend._apply 的 light.get(name) 会返回 None，颜色/模式/速度被静默丢掉，
+    # 表现是"改颜色不生效、要全部关了重开才出来"（2026-10-04 踩过）。
+    rec = []
+    real_seq = AuraDevice._write_seq
+    AuraDevice._write_seq = lambda self, pk, delay=0.01: rec.append(
+        [bytes(p) for p in pk])
+    try:
+        b.set_device("rear", True, 3,
+                     {"rear": {"mode": "static", "color": (0, 220, 120),
+                               "speed": "normal"}})
+    finally:
+        AuraDevice._write_seq = real_seq
+    if not any(p[1] == CMD_MODE and p[4:7] == bytes((0, 220, 120))
+               for p in rec[-1]):
+        print("FAIL: 颜色没进 SetMode —— light 可能没按设备名嵌套")
+        bad += 1
+    else:
+        print("OK   颜色能进 SetMode（light 按设备名嵌套）")
 
     steps = [
         ("关后盖(键盘不动)", lambda: b.set_device("rear", False)),
