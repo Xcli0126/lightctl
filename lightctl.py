@@ -35,7 +35,7 @@ errno_EACCES = _errno.EACCES
 errno_EPERM = _errno.EPERM
 
 APP_NAME = "lightctl"
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.3.0"
 CONFIG_DIR = os.path.expanduser("~/.config/lightctl")
 STATE_FILE = os.path.join(CONFIG_DIR, "state.json")
 SETTINGS_FILE = os.path.join(CONFIG_DIR, "settings.json")
@@ -830,15 +830,15 @@ def _combo(parent, var, values, cb, width=5):
 
 
 class Card:
+    """单台设备一张卡片。控件按行搭，搭建顺序即显示顺序。"""
+
     def __init__(self, parent, dev, on_change):
         self.dev = dev
         self.on_change = on_change
         self.on_key, self.lv_key = "on", "high"   # 卡片只存 key，显示时再翻译
         self.mode_key = "static"
         self.speed_key = "normal"
-        # 默认给显式白色。(0,0,0) 表示"设备自选色"（Aura rand=0xFF），
-        # 但 2026-10-04 实测：rand=0xFF 时本机键盘区不亮，键盘区必须给具体颜色。
-        self.color = (255, 255, 255)
+        self.color = DEFAULT_COLOR
         th = theme()
         self.frame = tk.LabelFrame(
             parent, text=" " + _dev_label(dev) + " ",
@@ -846,74 +846,89 @@ class Card:
             padx=12, pady=10,
         )
         self.frame.pack(fill="x", padx=14, pady=6)
+        self._build_switch(th)
+        self._build_level(th)
+        self._build_effect(th)
+        self._build_color(th)
+        self._build_footer(th)
 
-        r1 = tk.Frame(self.frame, bg=th["CARD_BG"]); r1.pack(fill="x")
-        _lbl(r1, t("switch"), th["CARD_BG"], th["FG_DIM"]).pack(side="left")
+    def _row(self, th, pad=(0, 0)):
+        """在卡片上新建一行并 pack，返回该行 Frame。"""
+        fr = tk.Frame(self.frame, bg=th["CARD_BG"])
+        fr.pack(fill="x", pady=pad)
+        return fr
+
+    def _build_switch(self, th):
+        r = self._row(th)
+        _lbl(r, t("switch"), th["CARD_BG"], th["FG_DIM"]).pack(side="left")
         self.sw_var = tk.StringVar(value=t("on"))
-        self.sw = _combo(r1, self.sw_var, [t("on"), t("off")], self._toggle)
+        self.sw = _combo(r, self.sw_var, [t("on"), t("off")], self._toggle)
         self.sw.pack(side="right")
 
-        r2 = tk.Frame(self.frame, bg=th["CARD_BG"]); r2.pack(fill="x", pady=(8, 0))
-        _lbl(r2, t("brightness"), th["CARD_BG"], th["FG_DIM"]).pack(side="left")
+    def _build_level(self, th):
+        r = self._row(th, (8, 0))
+        _lbl(r, t("brightness"), th["CARD_BG"], th["FG_DIM"]).pack(side="left")
         self.lv_var = tk.StringVar(value=t("high"))
-        self.lv = _combo(r2, self.lv_var, [t(x) for x in LEVELS], self._level)
+        self.lv = _combo(r, self.lv_var, [t(x) for x in LEVELS], self._level)
         self.lv.pack(side="right")
 
-        r3 = tk.Frame(self.frame, bg=th["CARD_BG"]); r3.pack(fill="x", pady=(10, 0))
+        r2 = self._row(th, (10, 0))
         self.btns = {code: _btn(
-            r3, t(code),
+            r2, t(code),
             lambda c=code: self.on_change(self.dev, "level", c),
             th["BTN_BG"], th["FG"], th["HL_BG"]) for code in LEVELS}
         for b in self.btns.values():
             b.pack(side="left", padx=(0, 6))
 
-        # 模式 + 速度（C: color/mode 控制）
-        r4 = tk.Frame(self.frame, bg=th["CARD_BG"]); r4.pack(fill="x", pady=(10, 0))
-        _lbl(r4, t("mode"), th["CARD_BG"], th["FG_DIM"]).pack(side="left")
+    def _build_effect(self, th):
+        r = self._row(th, (10, 0))
+        _lbl(r, t("mode"), th["CARD_BG"], th["FG_DIM"]).pack(side="left")
         self.mode_var = tk.StringVar(value=t("mode_static"))
-        self.mode_combo = _combo(r4, self.mode_var,
+        self.mode_combo = _combo(r, self.mode_var,
                                  [t("mode_" + m) for m in MODE_LIST],
                                  self._mode, width=8)
         self.mode_combo.pack(side="right")
-        _lbl(r4, t("speed"), th["CARD_BG"], th["FG_DIM"]).pack(side="left", padx=(12, 0))
+        _lbl(r, t("speed"), th["CARD_BG"],
+             th["FG_DIM"]).pack(side="left", padx=(12, 0))
         self.speed_var = tk.StringVar(value=t("speed_normal"))
-        self.speed_combo = _combo(r4, self.speed_var,
+        self.speed_combo = _combo(r, self.speed_var,
                                   [t("speed_" + s) for s in SPEED_LIST],
                                   self._speed, width=5)
         self.speed_combo.pack(side="right")
 
-        # 颜色：hex 输入 + 取色器 + 色块预览
-        r5 = tk.Frame(self.frame, bg=th["CARD_BG"]); r5.pack(fill="x", pady=(8, 0))
-        _lbl(r5, t("color"), th["CARD_BG"], th["FG_DIM"]).pack(side="left")
+    def _build_color(self, th):
+        # hex 输入 + 取色器 + 色块预览
+        r = self._row(th, (8, 0))
+        _lbl(r, t("color"), th["CARD_BG"], th["FG_DIM"]).pack(side="left")
         self.color_var = tk.StringVar(value=self._color_str())
-        self.color_entry = tk.Entry(r5, textvariable=self.color_var, width=9,
+        self.color_entry = tk.Entry(r, textvariable=self.color_var, width=9,
                                     bg=th["ENTRY_BG"], fg=th["FG"],
                                     insertbackground=th["FG"],
                                     font=("Mono", 10))
         self.color_entry.pack(side="right")
         self.color_entry.bind("<Return>", self._color)
         self.color_entry.bind("<FocusOut>", self._color)
-        self.color_sw = tk.Label(r5, text="  ", width=3,
+        self.color_sw = tk.Label(r, text="  ", width=3,
                                  bg=th["ENTRY_BG"], relief="solid", bd=1)
         self.color_sw.pack(side="right", padx=(0, 6))
-        self.pick_btn = tk.Button(r5, text=t("pick_color"),
+        self.pick_btn = tk.Button(r, text=t("pick_color"),
                                   command=self._pick_color,
                                   bg=th["BTN_BG"], fg=th["FG"], relief="flat",
                                   padx=6, pady=0)
         self.pick_btn.pack(side="right", padx=(0, 6))
 
         # 预设色：点一下直接设色
-        r6 = tk.Frame(self.frame, bg=th["CARD_BG"])
-        r6.pack(fill="x", pady=(4, 0))
+        r2 = self._row(th, (4, 0))
         self.preset_btns = []
         for rgb in COLOR_PRESETS:
             hexcol = "#%02x%02x%02x" % rgb
-            b = tk.Button(r6, text="", width=2, relief="solid", bd=1,
+            b = tk.Button(r2, text="", width=2, relief="solid", bd=1,
                           bg=hexcol, activebackground=hexcol,
                           command=lambda c=rgb: self._preset(c))
             b.pack(side="left", padx=1)
             self.preset_btns.append((b, rgb))
 
+    def _build_footer(self, th):
         self.path_lbl = _lbl(self.frame, "", th["CARD_BG"], th["FG_DIM"],
                              font=("Mono", 8))
         self.path_lbl.config(anchor="w")
@@ -1413,16 +1428,11 @@ def _set_wm_class(win_id, res_name, res_class):
 
 # ---------- UI：主窗口 ----------
 class App(tk.Tk):
-    def __init__(self):
+    def __init__(self, single):
         super().__init__()
-        # 单实例锁：防止多开（多个实例叠在一起会让用户觉得"点了没反应"）。
-        # 用 abstract unix socket，第二个实例检测到就激活第一个并退出。
-        self._single = _SingleInstance()
-        if not self._single.ok:
-            # 第二个实例：_SingleInstance 已经请求过"把窗口叫出来"，这里直接退出
-            self._primary_exists = True
-            return
-        self._primary_exists = False
+        # 单实例锁由 main() 先抢；抢不到就根本不会构造 App ——
+        # 免得第二个实例白建一个窗口、白起托盘和监听线程再销毁。
+        self._single = single
         # 收到第二个实例的 show 请求 → 回到主线程抬窗口
         self._single.on_show = lambda: self.after(0, self.show_window)
         self.settings = load_settings()
@@ -1514,11 +1524,8 @@ class App(tk.Tk):
             self.after(150, lambda: self._on_fw_backlight(lv, raw))
             return
         on = lv != "off"
-        st = self._remember_light("keyboard")
-        st["on"] = on
-        st["level"] = lv
+        self._mark("keyboard", on, lv)
         save_state(self.state)
-        self.cards["keyboard"].set_state(on, lv)
         self.log_lbl.config(
             text=f"{_dev_label('keyboard')} → {t(lv)}  (Fn+F11)")
         self._sync_tray_icon()
@@ -1666,7 +1673,7 @@ class App(tk.Tk):
     def _remember_light(self, dev):
         """把卡片上的模式/颜色/速度写进 state，并返回该设备的状态字典。
 
-        改 on/level 一律走这里 —— 直接整体赋值会把灯效键覆盖掉。
+        改 on/level 一律走 _mark() —— 直接整体赋值会把灯效键覆盖掉。
         """
         st = self.state.setdefault(dev, {})
         c = self.cards.get(dev)
@@ -1675,6 +1682,13 @@ class App(tk.Tk):
             st["speed"] = c.speed_key
             st["color"] = list(c.color)
         return st
+
+    def _mark(self, dev, on, level):
+        """把某设备的开关/档位同时落到 state 与卡片上（不写盘）。"""
+        st = self._remember_light(dev)
+        st["on"] = on
+        st["level"] = level
+        self.cards[dev].set_state(on, level)
 
     def _on_change(self, dev, kind, value):
         if kind == "toggle":
@@ -1761,11 +1775,8 @@ class App(tk.Tk):
             self.cards[dev].set_state(st.get("on", True), st.get("level", "high"))
 
         def ok(msg):
-            st = self._remember_light(dev)
-            st["on"] = on
-            st["level"] = level
+            self._mark(dev, on, level)
             save_state(self.state)
-            self.cards[dev].set_state(on, level)
             self.log_lbl.config(
                 text=f"{_dev_label(dev)} → {t(level if on else 'off')}")
             self._sync_tray_icon()
@@ -1791,10 +1802,7 @@ class App(tk.Tk):
 
         def ok(msg):
             for d in DEVICES:
-                st = self._remember_light(d)
-                st["on"] = on
-                st["level"] = level_key
-                self.cards[d].set_state(on, level_key)
+                self._mark(d, on, level_key)
             save_state(self.state)
             self.log_lbl.config(text=msg)
             self._sync_tray_icon()
@@ -1804,10 +1812,7 @@ class App(tk.Tk):
                 # 部分成功：(ok_names, errs)，成功设备落状态，失败设备回滚
                 ok_names, errs = msg[0], msg[1]
                 for d in ok_names:
-                    st = self._remember_light(d)
-                    st["on"] = on
-                    st["level"] = level_key
-                    self.cards[d].set_state(on, level_key)
+                    self._mark(d, on, level_key)
                 save_state(self.state)
                 rollback([d for d in DEVICES if d not in ok_names])
                 self.log_lbl.config(
@@ -2000,15 +2005,13 @@ def main():
     args = ap.parse_args()
     if args.selftest:
         raise SystemExit(selftest())
-    app = App()
-    if getattr(app, "_primary_exists", False):
-        # 已有实例在跑：销毁这个半成品窗口，提示后退出
-        try:
-            app.destroy()
-        except tk.TclError:
-            pass
-        sys.stderr.write("lightctl: 已有实例在运行，激活已有窗口。\n")
-        raise SystemExit(0)
+    # 先抢单实例锁：抢不到就直接退出，不建窗口
+    # （第二个实例已经在 _SingleInstance 里请求过"把已有窗口叫出来"）。
+    single = _SingleInstance()
+    if not single.ok:
+        sys.stderr.write("lightctl: 已有实例在运行，已把它叫到前台。\n")
+        return 0
+    app = App(single)
     try:
         app.update_idletasks()
         if args.geometry:
@@ -2022,7 +2025,8 @@ def main():
     if args.open_settings:
         app.after(600, app.open_settings)
     app.mainloop()
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

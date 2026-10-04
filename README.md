@@ -114,8 +114,33 @@ OK   全开: 全部已打开
 
 ## 状态持久化
 
-开关状态存 `~/.config/lightctl/state.json`（带 `schema` 版本号，加载时自动丢弃旧版遗留键并校验取值），
-重启 GUI 自动恢复上次的开关/亮度显示。配置文件用「临时文件 + rename」原子写入，断电或被杀不会留半截 JSON。
+开关/档位/**模式/颜色/速度**存 `~/.config/lightctl/state.json`（schema 3，带版本号，
+加载时丢弃旧版遗留键并校验取值，坏值回落默认）。配置文件用「临时文件 + rename」原子写入，
+断电或被杀不会留半截 JSON。
+
+启动时不只是把界面恢复回来，还会**往硬件重放一次** —— Aura 写入不更新内核 LED 节点，
+不重放就会出现"卡片写着开、灯却是灭的"。
+
+## 代码结构
+
+单文件 `lightctl.py`，自上而下五段：
+
+| 段 | 内容 |
+|---|---|
+| 常量 / i18n / 主题 | 协议字节、设备表、`_STRINGS`（zh/en 键集合由 `_i18n_check` 强制一致）、配色 |
+| 持久化 | `load_state` / `save_state` / `load_settings`，原子写 + 取值校验 |
+| 协议层 | `AuraDevice`（包构造与下发）、`find_aura_nodes`（按 PID + Report ID `0x5d` 认设备） |
+| 后端 | `Backend._apply` 是唯一的硬件入口，`set_device` / `set_all` 都走它 |
+| UI | `Card`（一台设备一张卡，控件按行拆成 `_build_*`）、`Tray`、`SettingsDialog`、`App` |
+
+三个刻意的约定，改的时候别踩：
+
+- `Backend._apply` 的 `light` **必须按设备名嵌套**（`{device: {mode, color, speed}}`）。
+  传扁平字典时 `light.get(name)` 返回 `None`，颜色/模式/速度会被静默丢掉退回默认
+  —— 自测里有一条抓包断言专门盯这个。
+- 改 on/level 一律走 `App._mark()`（内部经 `_remember_light()`），整体赋值会把灯效键覆盖掉。
+- 单实例锁在 `main()` 里先抢，抢不到直接退出、不建窗口；第二个实例通过 abstract socket
+  发一句 `show`，由已有实例把窗口抬到前台。
 
 ## 系统要求
 
