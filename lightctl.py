@@ -37,7 +37,7 @@ errno_ENODEV = _errno.ENODEV
 errno_ENOENT = _errno.ENOENT
 
 APP_NAME = "lightctl"
-APP_VERSION = "1.4.0"
+APP_VERSION = "1.5.0"
 CONFIG_DIR = os.path.expanduser("~/.config/lightctl")
 STATE_FILE = os.path.join(CONFIG_DIR, "state.json")
 SETTINGS_FILE = os.path.join(CONFIG_DIR, "settings.json")
@@ -129,6 +129,9 @@ _STRINGS = {
         "partial_msg": "部分完成：{m}",
         "err_perm": "权限不足：{p}（需要 udev 规则）",
         "color_bad": "颜色格式应为 RRGGBB 或 auto",
+        "light_saved": "已记住，开灯时生效",
+        "tray_hidden": "已隐藏到托盘（托盘菜单里可退出）",
+        "tray_na": "需要 PyGObject",
         "settings_title": "设置",
         "language": "界面语言",
         "lang_zh": "简体中文", "lang_en": "English",
@@ -179,6 +182,9 @@ _STRINGS = {
         "partial_msg": "Partially done: {m}",
         "err_perm": "Permission denied: {p} (udev rule required)",
         "color_bad": "Color must be RRGGBB or auto",
+        "light_saved": "Saved; applies when switched on",
+        "tray_hidden": "Hidden to tray (quit from the tray menu)",
+        "tray_na": "requires PyGObject",
         "settings_title": "Settings",
         "language": "Language",
         "lang_zh": "简体中文", "lang_en": "English",
@@ -282,7 +288,8 @@ def load_settings():
 
 
 def save_settings(s):
-    _write_json(SETTINGS_FILE, s)
+    """写设置，返回是否成功（调用方要能把失败讲给用户听）。"""
+    return _write_json(SETTINGS_FILE, s)
 
 
 def _clean_color(c):
@@ -353,16 +360,20 @@ def set_autostart(enabled):
 
 
 def autostart_enabled():
+    """是否已装自启动。只读。
+
+    以前这里顺手把旧格式文件重写了一遍 —— 一个 getter 带写副作用，而且文件
+    读不到时照样 return True，设置页会一直勾着"开机自启动"却根本没装。
+    格式迁移交给 set_autostart（用户下次开关时自然发生）。
+    """
     if not os.path.exists(AUTOSTART_FILE):
         return False
-    # 旧版自启动文件 Exec 没引号/写死 python3，检测到就按当前格式重写
     try:
         with open(AUTOSTART_FILE, encoding="utf-8") as f:
-            if "Exec=\"" not in f.read():
-                set_autostart(True)
-    except OSError:
-        pass
-    return True
+            return "Exec=" in f.read()
+    except OSError as e:
+        sys.stderr.write(f"lightctl: read {AUTOSTART_FILE}: {e}\n")
+        return False
 
 
 # ---------- 协议层 ----------
@@ -573,6 +584,8 @@ class Backend:
                 continue
             dev = AuraDevice(self.nodes[name])
             cfg = light.get(name) or {}
+            # level 可以是单个 int，也可以是 {设备名: int}（"全部打开"时逐设备取档位）
+            lvl = level.get(name, 3) if isinstance(level, dict) else level
             color = cfg.get("color", (0, 0, 0))
             if name == "keyboard" and color == (0, 0, 0):
                 # 键盘区给"设备自选色"(rand=0xFF) 实测会一直全黑
@@ -580,7 +593,7 @@ class Backend:
                 color = (255, 255, 255)
             try:
                 if on:
-                    dev.turn_on(level, mode=cfg.get("mode", "static"),
+                    dev.turn_on(lvl, mode=cfg.get("mode", "static"),
                                 color=color,
                                 speed=cfg.get("speed", "normal"))
                 else:
@@ -1034,10 +1047,13 @@ class Card:
     def _color(self, _e=None):
         rgb = self._parse_color(self.color_var.get())
         if rgb is None:
-            # 非法输入：回滚到上次值并提示（on_change 是 App 方法，日志行可用）
+            # 非法输入：回滚到上次值，提示写在本卡片的徽章上 ——
+            # 写主窗口日志行离得太远，而且会被下一次操作的日志覆盖。
             self.color_var.set(self._color_str())
-            if hasattr(self.on_change, "__self__"):
-                self.on_change.__self__.log_lbl.config(text=t("color_bad"))
+            self.badge.config(text="● " + t("color_bad"),
+                              fg=theme()["FG_ERR"])
+            self.frame.after(2500, lambda: self.set_state(
+                self.on_key == "on", self.lv_key))
             return
         self._set_color(rgb)
 
@@ -1174,17 +1190,23 @@ class Card:
 
 
 # ---------- UI：设置对话框 ----------
-def _row(parent, label_key, var, values, cb, pad):
-    """一行 = 左标签 + 右下拉。label_key 是 i18n 键，存进 tk 属性供 retranslate 用。"""
+def _row(parent, label_key, var, value_keys, cb, pad):
+    """一行 = 左标签 + 右下拉。
+
+    value_keys 是 i18n 键列表（不是已翻译的文本）：这样 retranslate 能拿同一份
+    键把下拉的 values 一起换掉 —— 否则切语言后选中值变了，展开还是旧语言。
+    """
     fr = tk.Frame(parent, bg=theme()["BG"])
     fr.pack(fill="x", **pad)
     lb = _lbl(fr, t(label_key), theme()["BG"], theme()["FG"])
     lb.pack(side="left")
     lb._i18n_key = label_key
-    c = ttk.Combobox(fr, textvariable=var, values=values,
+    c = ttk.Combobox(fr, textvariable=var, values=[t(k) for k in value_keys],
                      state="readonly", width=8)
     c.pack(side="right")
     c.bind("<<ComboboxSelected>>", cb)
+    parent._combos = getattr(parent, "_combos", [])
+    parent._combos.append((c, value_keys))
 
 
 def _check(parent, key, var, cmd, pad):
@@ -1217,17 +1239,20 @@ class SettingsDialog(tk.Toplevel):
         self.lang_var = tk.StringVar(
             value=t("lang_" + s.get("lang", "zh")))
         _row(self, "language", self.lang_var,
-             [t("lang_" + c) for c in self.lang_codes],
-             self._on_lang, pad)
+             ["lang_" + c for c in self.lang_codes], self._on_lang, pad)
         self.theme_var = tk.StringVar(
             value=t("theme_" + s.get("theme", "dark")))
         _row(self, "theme", self.theme_var,
-             [t("theme_" + c) for c in self.theme_codes],
-             self._on_theme, pad)
+             ["theme_" + c for c in self.theme_codes], self._on_theme, pad)
 
         # 托盘 / 自启
-        self.tray_var = tk.BooleanVar(value=s.get("tray", True))
-        _check(self, "tray", self.tray_var, self._on_tray, pad)
+        # 托盘不可用（没装 PyGObject）时别给一个点了没反应的勾选框
+        tray_ok = bool(getattr(app, "tray", None) and app.tray._available)
+        self.tray_var = tk.BooleanVar(value=tray_ok and s.get("tray", True))
+        tray_cb = _check(self, "tray", self.tray_var, self._on_tray, pad)
+        if not tray_ok:
+            tray_cb.config(state="disabled")
+            self._tray_hint = t("tray_na")
         self.auto_var = tk.BooleanVar(value=autostart_enabled())
         _check(self, "autostart", self.auto_var, self._on_autostart, pad)
 
@@ -1240,6 +1265,9 @@ class SettingsDialog(tk.Toplevel):
         self._fb_lbl = tk.Label(self, text="", bg=th["BG"], fg=th["FG_OK"],
                                 font=("Sans", 9), anchor="w")
         self._fb_lbl.pack(fill="x", padx=16)
+        if getattr(self, "_tray_hint", ""):
+            # 托盘依赖缺失时把原因说在设置页里，别让勾选框变成一个哑控件
+            self._fb_lbl.config(text=self._tray_hint)
 
         close_btn = tk.Button(self, text=t("close"), command=self.destroy,
                               bg=th["BTN_BG"], fg=th["FG"], relief="flat",
@@ -1254,6 +1282,9 @@ class SettingsDialog(tk.Toplevel):
         self.lang_var.set(t("lang_" + self.app.settings.get("lang", "zh")))
         self.theme_var.set(
             t("theme_" + self.app.settings.get("theme", "dark")))
+        # 下拉的候选值也要跟着语言换，否则选中值变了、展开还是旧语言
+        for combo, keys in getattr(self, "_combos", []):
+            combo.config(values=[t(k) for k in keys])
         for w in self._all_widgets(self):
             key = getattr(w, "_i18n_key", None)
             if not key:
@@ -1303,7 +1334,7 @@ class SettingsDialog(tk.Toplevel):
         self.app.settings["lang"] = self._code_of(
             [t("lang_" + c) for c in self.lang_codes],
             self.lang_codes, self.lang_var.get(), "zh")
-        save_settings(self.app.settings)
+        self._save()
         set_lang(self.app.settings["lang"])
         self.app.retranslate()
         self.retranslate()
@@ -1312,14 +1343,14 @@ class SettingsDialog(tk.Toplevel):
         self.app.settings["theme"] = self._code_of(
             [t("theme_" + c) for c in self.theme_codes],
             self.theme_codes, self.theme_var.get(), "dark")
-        save_settings(self.app.settings)
+        self._save()
         set_theme(self.app.settings["theme"])
         self.app.retheme()
         self.retheme()
 
     def _on_tray(self):
         self.app.settings["tray"] = self.tray_var.get()
-        save_settings(self.app.settings)
+        self._save()
         self.app.apply_tray()
 
     def _on_autostart(self):
@@ -1329,6 +1360,15 @@ class SettingsDialog(tk.Toplevel):
         else:
             messagebox.showerror(t("settings_title"),
                                  t("fail", m=AUTOSTART_FILE), parent=self)
+
+    def _save(self):
+        """写设置并在失败时明确告知。
+
+        以前直接丢掉 _write_json 的返回值：~/.config 只读或磁盘满时界面照常
+        显示成功，重启后设置全部还原，用户完全不知道发生了什么。
+        """
+        if not save_settings(self.app.settings):
+            self._feedback(t("fail", m=SETTINGS_FILE))
 
     def _feedback(self, msg):
         """对话框内短暂显示操作反馈。"""
@@ -1418,9 +1458,15 @@ def _set_wm_class_by_title(title, res_name, res_class):
         import ctypes
         x11 = ctypes.CDLL(ctypes.util.find_library("X11"))
         x11.XOpenDisplay.restype = ctypes.c_void_p
+        x11.XCloseDisplay.argtypes = [ctypes.c_void_p]
         dpy = x11.XOpenDisplay(None)
         if not dpy:
             return
+    except Exception:
+        return
+    # Display 和 XQueryTree 返回的 kids 数组都要显式释放：
+    # 这个函数在启动和切语言时都会跑，不释放就是每次一个泄漏。
+    try:
         root = x11.XDefaultRootWindow(dpy)
         class _Hint(ctypes.Structure):
             _fields_ = [("res_name", ctypes.c_char_p),
@@ -1448,38 +1494,23 @@ def _set_wm_class_by_title(title, res_name, res_class):
             kids = ctypes.POINTER(ctypes.c_ulong)()
             x11.XQueryTree(dpy, w, ctypes.byref(par), ctypes.byref(rw),
                            ctypes.byref(kids), ctypes.byref(n))
-            for i in range(n.value):
-                if _walk(kids[i], depth + 1):
-                    return True
+            try:
+                for i in range(n.value):
+                    if _walk(kids[i], depth + 1):
+                        return True
+            finally:
+                if kids:
+                    x11.XFree(kids)
             return False
 
         _walk(root)
     except Exception:
         pass
-
-
-def _set_wm_class(win_id, res_name, res_class):
-    """从 X11 侧改窗口的 WM_CLASS（Tk 默认是 "tk"/"Tk"，任务栏按这个显示）。
-    Tk 没有暴露 API，用 ctypes 调 Xlib 的 XSetClassHint。非 X11（纯 Wayland）时静默跳过。
-    注意：Mutter 在 Wayland 下用 x11-frames 代理 X11 窗口，WM_CLASS 可能仍显示 Tk ——
-    这里只改 client window 的属性，尽力而为。"""
-    try:
-        import ctypes
-        x11 = ctypes.CDLL(ctypes.util.find_library("X11"))
-        x11.XOpenDisplay.restype = ctypes.c_void_p
-        dpy = x11.XOpenDisplay(None)
-        if not dpy:
-            return
-        class _Hint(ctypes.Structure):
-            _fields_ = [("res_name", ctypes.c_char_p),
-                        ("res_class", ctypes.c_char_p)]
-        hint = _Hint(res_name.encode(), res_class.encode())
-        x11.XSetClassHint.argtypes = [ctypes.c_void_p, ctypes.c_ulong,
-                                      ctypes.POINTER(_Hint)]
-        x11.XSetClassHint(dpy, win_id, ctypes.byref(hint))
-        x11.XFlush(dpy)
-    except Exception:
-        pass
+    finally:
+        try:
+            x11.XCloseDisplay(dpy)
+        except Exception:
+            pass
 
 
 # ---------- UI：主窗口 ----------
@@ -1756,17 +1787,13 @@ class App(tk.Tk):
         st["level"] = level
         self.cards[dev].set_state(on, level)
 
-    def _on_change(self, dev, kind, value):
+    def _on_change(self, dev, kind, value, _retry=0):
         if kind == "toggle":
             if value:
-                lv = self.cards[dev].lv_var.get()
-                inv = {t(x): x for x in LEVELS}
-                lv = inv.get(lv, "high")
-                if lv == "off":
-                    # 档位停在"关"时打开开关：要给个非 0 亮度，否则会发
-                    # POWER_ON + brightness(0)，灯是黑的而状态写"开"。
-                    lv = "high"
-                self._exec(dev, True, lv)
+                # 档位停在"关"时打开开关要给个非 0 亮度，否则会发
+                # POWER_ON + brightness(0)，灯是黑的而状态写"开"。
+                lv = self.cards[dev].lv_key
+                self._exec(dev, True, lv if lv != "off" else "high")
             else:
                 self._exec(dev, False, "off")
         elif kind == "level":
@@ -1778,9 +1805,21 @@ class App(tk.Tk):
             # 模式/颜色/速度改动：先落盘（关着灯也要记住），灯开着立刻重下发
             st = self._remember_light(dev)
             save_state(self.state)
-            if st.get("on", True):
-                lv = self.cards[dev].lv_key
-                self._exec(dev, True, lv if lv != "off" else "high")
+            if not st.get("on", True):
+                self.log_lbl.config(
+                    text=f"{_dev_label(dev)}: {t('light_saved')}")
+                return
+            if self._busy:
+                # 当前有写入在飞。以前这里直接返回，结果是"状态存了、下拉也变了、
+                # 硬件一包没发"。等当前操作结束后补发，最多等 8 秒。
+                if _retry < 40:
+                    self.after(200, lambda: self._on_change(
+                        dev, "light", None, _retry + 1))
+                else:
+                    self.log_lbl.config(text=t("fail", m="timeout"))
+                return
+            lv = self.cards[dev].lv_key
+            self._exec(dev, True, lv if lv != "off" else "high")
 
     def _run_async(self, call, on_ok, on_fail, rollback):
         """公共骨架：忙碌检查 → 线程执行 call() → 主线程回调。
@@ -1874,9 +1913,12 @@ class App(tk.Tk):
                         ok, fail, rollback)
 
     def _all(self, on):
-        lvl = 3 if on else 0
+        # 逐设备带上各自卡片上的档位与灯效。以前档位硬编码成 high，
+        # 用户把后盖调成"低"之后点"全部打开"会被悄悄改成"高"。
+        key_of = {d: (self.cards[d].lv_key if self.cards[d].lv_key != "off"
+                      else "high") for d in DEVICES}
+        num_of = {d: LEVEL_NUM.get(k, 3) for d, k in key_of.items()}
         level_key = "high" if on else "off"
-        # 逐设备带上各自卡片的灯效，避免批量操作把灯效重置成默认
         lights = {d: self.cards[d].light_cfg() for d in DEVICES}
 
         def rollback(names=None):
@@ -1887,7 +1929,7 @@ class App(tk.Tk):
 
         def ok(msg):
             for d in DEVICES:
-                self._mark(d, on, level_key)
+                self._mark(d, on, key_of[d] if on else "off")
             save_state(self.state)
             self.log_lbl.config(text=msg)
             self._sync_tray_icon()
@@ -1897,7 +1939,7 @@ class App(tk.Tk):
                 # 部分成功：(ok_names, errs)，成功设备落状态，失败设备回滚
                 ok_names, errs = msg[0], msg[1]
                 for d in ok_names:
-                    self._mark(d, on, level_key)
+                    self._mark(d, on, key_of[d] if on else "off")
                 save_state(self.state)
                 rollback([d for d in DEVICES if d not in ok_names])
                 self.log_lbl.config(
@@ -1908,7 +1950,8 @@ class App(tk.Tk):
             rollback()
 
         self._run_async(
-            lambda: self.backend.set_all(on, lvl, lights if on else None),
+            lambda: self.backend.set_all(on, num_of if on else 0,
+                                         lights if on else None),
             ok, fail, rollback)
 
     # ---------- 托盘联动 ----------
@@ -1954,11 +1997,21 @@ class App(tk.Tk):
     def _on_close(self):
         if self.settings.get("tray", True) and self.tray.ind:
             self.withdraw()
+            # 关窗只是隐藏，程序还在跑。不说明的话第一次用的人会以为已经退出
+            self.log_lbl.config(text=t("tray_hidden"))
         else:
             self.shutdown()
 
     def shutdown(self):
-        """安全退出（不覆盖 Tk 内建 quit）。"""
+        """安全退出（不覆盖 Tk 内建 quit）。
+
+        有硬件写入在飞时先等它落地：一轮 turn_on 是 14 包 × 0.02s，中途被杀会
+        留下"只发一半"的中间态（要等下一次成功写入才纠正）。最多等 2 秒。
+        """
+        self._shutdown_wait = getattr(self, "_shutdown_wait", 0) + 1
+        if self._inflight and self._shutdown_wait < 20:
+            self.after(100, self.shutdown)
+            return
         try:
             self._fw_stop.set()
         except Exception:
