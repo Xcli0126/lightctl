@@ -10,6 +10,8 @@ ROG Flow Z13 (GZ302EA) 灯光控制 GUI —— 独立开关背光（后部灯条
 - **设置**：界面语言（中/英）、主题（深色/浅色）、托盘开关、开机自启动，全部即时生效
 - 窗口图标 + 托盘图标由 PIL 程序化绘制（灯泡 + 状态点），无外部图片资源
 - 关窗自动隐藏到托盘（托盘开启时），从托盘菜单退出
+- **一次性命令行**：`--set` / `--level` / `--mode` / `--speed` / `--color` 不开窗口直接下发，
+  有 GUI 时交给 GUI 执行（见下文）
 - `--selftest` 不开 GUI 验证全链路，`--version` 看版本
 
 ## 解决什么问题
@@ -62,7 +64,7 @@ lightctl 取了 g-helper 的协议精华（按 PID 路由 + 按位 power），�
 
 ```bash
 # 1. 克隆
-git clone https://github.com/YOUR_NAME/lightctl.git
+git clone https://github.com/Xcli0126/lightctl.git
 cd lightctl
 
 # 2. 装 udev 规则（免 root 访问 hidraw，一次性）
@@ -105,12 +107,26 @@ lightctl --level rear=medium --color rear=00dc78 --mode rear=breathe --speed rea
 lightctl --color keyboard=#00c8ff --mode keyboard=static
 ```
 
-- 参数一律写 `设备=值`，设备是 `rear` 或 `keyboard`，可重复；值写错立即报错并以退出码 1 退出，
-  不会静默按默认值处理。
+参数一律写 `设备=值`，设备是 `rear`（后盖灯条）或 `keyboard`，可重复：
+
+| 参数 | 取值 | 说明 |
+|---|---|---|
+| `--set` | `on` / `off`（也收 `1`/`0`、`true`/`false`、`yes`/`no`） | 开 / 关单路 |
+| `--level` | `off` / `low` / `medium` / `high` | 档位；`off` 等于关灯，其它档位顺带把这一路打开 |
+| `--mode` | `static` / `breathe` / `cycle` / `rainbow` / `strobe` | 灯效模式 |
+| `--speed` | `slow` / `normal` / `fast` | 灯效速度 |
+| `--color` | `RRGGBB` / `#RRGGBB` / `auto` | `auto` 是"设备自选色"，键盘那路踩过坑，见上文实测 |
+| `--minimized` | 无值 | 启动后不显示窗口（开机自启用），自启条目里已经带上它 |
+
+- 值或设备名写错立即报错，退出码 1，不会静默按默认值处理（曾把 `--set rear=bogus` 当成关灯）；
+  argparse 自己的用法错误（比如参数名打错）才是退出码 2。
+- 同一路同时写 `--set` 和 `--level` 时以 `--set` 为准：先落档位，再落开关。
+  只写 `--set x=on` 而这路原来停在 `off` 档，档位会自动补到 `high`（不会发出亮度 0 的"开"）。
 - **有 GUI 在跑时，这些改动会交给 GUI 执行**：GUI 才是 `state.json` 的唯一写入方，
-  让命令行直接改文件会被它下一次写盘整体覆盖掉（实测过）。没 GUI 时命令行自己下发并落盘。
-- `--minimized`：启动后不显示窗口（开机自启用的，自启条目里已经带上它），
-  之后点桌面图标或托盘菜单即可叫出来。
+  让命令行直接改文件会被它下一次写盘整体覆盖掉（实测过）。没 GUI 时命令行自己下发并落盘，
+  任一路下发失败退出码 1。
+- `--minimized` 之后点桌面图标或托盘菜单即可把窗口叫出来；另外 `--geometry WxH+X+Y`
+  指定窗口位置、`--open-settings` 启动即打开设置页，都是 GUI 启动参数。
 
 ## 自测
 
@@ -120,16 +136,17 @@ lightctl --color keyboard=#00c8ff --mode keyboard=static
 python3 lightctl.py --selftest
 ```
 
-输出四步全 OK 即链路通：
+末尾打印 `自测通过`（退出码 0）即链路通。顺序是：
 
-```
-节点: {'keyboard': '/dev/hidraw4', 'rear': '/dev/hidraw9'}
-OK   关后盖(键盘不动): 背光（后部灯条） → 关
-OK   开后盖: 背光（后部灯条） → 开
-OK   关键盘: 键盘灯 → 关
-OK   全开: 全部已打开
-自测通过
-```
+1. `OK i18n keys consistent` —— zh/en 键集合一致，源码里用到的键都存在
+2. `OK protocol bytes (mode/commit/power)` —— SetMode / Commit / Power 包结构断言
+3. 找设备，打印 `节点: {'keyboard': ..., 'rear': ...}`；缺哪台就 `FAIL` 并以退出码 1 结束
+4. 三条回归断言：颜色能进 SetMode（`light` 按设备名嵌套）、`set_all` 部分失败能区分出成功名单、
+   锁被占住时给出可恢复提示
+5. 最后四步**真的开关灯**：关后盖（键盘不动）→ 开后盖 → 关键盘 → 全开，
+   每步打印 `OK <步骤>: <结果>` 或 `FAIL <步骤>: <结果>`
+
+第 5 步会动到你机器上的灯，在用的机器上别随手跑。
 
 ## 状态持久化
 
